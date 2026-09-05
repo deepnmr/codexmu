@@ -12,7 +12,7 @@ Codex의 여러 ChatGPT 계정을 저장하고, 사용 한도에 도달하면 �
 
 Node.js **24 이상**과 공식 Codex가 필요합니다. npm 패키지는 macOS / Linux의 ARM64·x64 실행 파일을 포함하며, 설치 시 Rust 빌드나 별도 바이너리 다운로드를 하지 않습니다.
 
-공개 npm 배포 후에는 다음 명령으로 설치합니다. **현재 저장소에 배포 구성을 추가한 상태이며, 공개 레지스트리 게시 여부는 별도로 확인해야 합니다.**
+공개 npm 레지스트리에서 설치합니다:
 
 ```sh
 npm install -g codexmu
@@ -216,7 +216,7 @@ python3 tests/terminal.py --codex-bin "$(command -v codex)" --sessions 3 --resiz
 
 `package.json`과 `Cargo.toml`의 버전을 함께 변경하세요. GitHub 저장소에 코드를 올린 뒤 Actions의 **npm release → Run workflow**를 실행하면 네 플랫폼의 바이너리를 빌드·검증하고 `npm-package` 아티팩트에 설치 가능한 `.tgz`를 만듭니다. Linux는 musl 타깃으로 빌드합니다.
 
-공개 게시하려면 해당 npm 패키지에 게시 권한이 있는 토큰을 저장소의 Actions secret **`NPM_TOKEN`**에 등록하고, 워크플로의 **publish**를 선택하세요. 패키지 이름을 바꾸려면 `package.json`의 `name`을 변경하면 됩니다. 워크플로는 네 플랫폼의 빌드와 검증이 모두 성공한 뒤 패키지를 게시합니다.
+게시하려면 `npm-package` 아티팩트를 내려받고, `npm login`한 머신에서 `npm publish ./codexmu-<version>.tgz --access public`을 실행하세요. npm은 게시 계정에 2단계 인증(2FA)을 요구하며, 명령 실행 시 브라우저 승인 단계가 열립니다. CI에서 게시하려면 granular npm 토큰을 저장소의 Actions secret **`NPM_TOKEN`**에 등록하고 워크플로의 **publish**를 선택하세요. 패키지 이름을 바꾸려면 `package.json`의 `name`을 변경하면 됩니다. 워크플로는 네 플랫폼의 빌드와 검증이 모두 성공한 뒤 패키지를 게시합니다.
 
 로컬 `npm publish`도 네 플랫폼 실행 파일이 모두 있는지 먼저 확인합니다. `npm pack`은 현재 플랫폼만으로 허용하므로 로컬 설치 테스트에 사용할 수 있습니다. 이 로컬 전용 `.tgz`를 공개 게시하지 마세요. 의존 npm 패키지와 설치 스크립트는 없습니다.
 

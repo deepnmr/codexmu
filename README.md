@@ -12,7 +12,7 @@ A Rust program that stores multiple ChatGPT accounts for Codex and automatically
 
 Requires **Node.js 24 or later** and official Codex. The release package bundles macOS / Linux binaries for ARM64 and x64, without a Rust build or separate binary download during installation.
 
-After publication to npm, install with the following commands. **This repository contains the release configuration; public registry publication must be checked separately.**
+Install from the public npm registry:
 
 ```sh
 npm install -g codexmu
@@ -216,7 +216,7 @@ See [AGENTS.md](AGENTS.md) for the code layout, authentication and concurrency i
 
 Update the versions in `package.json` and `Cargo.toml` together. After pushing the code to GitHub, select **npm release → Run workflow** in Actions to build and check all four platforms and create an installable `.tgz` in the `npm-package` artifact. Linux builds use musl targets.
 
-To publish publicly, add a token with permission to publish the npm package as the repository's **`NPM_TOKEN`** Actions secret and select **publish** in the workflow. Change `name` in `package.json` to rename the package. The workflow publishes only after builds and checks succeed for all four platforms.
+To publish, download the `npm-package` artifact and run `npm publish ./codexmu-<version>.tgz --access public` from a machine logged in with `npm login`. npm requires two-factor authentication on the publishing account; the command opens a browser approval step. Alternatively, add a granular npm token as the repository's **`NPM_TOKEN`** Actions secret and select **publish** in the workflow to publish from CI. Change `name` in `package.json` to rename the package. The workflow publishes only after builds and checks succeed for all four platforms.
 
 Local `npm publish` also checks that executables for all four platforms are present. `npm pack` permits a current-platform-only package for local installation tests; do not publish that local-only `.tgz` publicly. There are no npm dependencies or installation scripts.
 
