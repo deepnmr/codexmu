@@ -1,0 +1,6 @@
+/target/
+__pycache__/
+/vendor/
+/dist/
+/node_modules/
+*.tgz

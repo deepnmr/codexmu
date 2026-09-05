@@ -1,0 +1,30 @@
+{
+  "name": "codexmu",
+  "version": "0.1.0",
+  "description": "Multi-account manager and automatic account switching for Codex",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "codexmu": "bin/codexmu.mjs"
+  },
+  "files": [
+    "bin/",
+    "vendor/",
+    "docs/terminal-preview.png"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"],
+  "scripts": {
+    "build": "cargo build --release --locked && node scripts/package.mjs stage",
+    "test": "node tests/npm.mjs",
+    "prepack": "node scripts/package.mjs check",
+    "prepublishOnly": "node scripts/package.mjs check-all"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

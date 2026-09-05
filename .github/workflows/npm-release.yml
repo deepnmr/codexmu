@@ -1,0 +1,79 @@
+name: npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm (requires NPM_TOKEN)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: node scripts/package.mjs stage ${{ matrix.target }}
+      - run: npm test
+      - run: python3 tests/check.py
+        env:
+          CODEXMU_TEST_BIN: bin/codexmu.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: vendor/
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: vendor/
+          merge-multiple: true
+      - run: chmod +x vendor/*/codexmu
+      - run: node scripts/package.mjs check-all
+      - run: npm pkg set repository.type=git repository.url="git+https://github.com/${GITHUB_REPOSITORY}.git"
+      - run: mkdir -p dist && npm pack --pack-destination dist
+      - run: npm install --global --prefix "$RUNNER_TEMP/npm-check" --ignore-scripts ./dist/*.tgz
+      - run: '"$RUNNER_TEMP/npm-check/bin/codexmu" --version'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: dist/*.tgz
+          if-no-files-found: error
+      - if: inputs.publish
+        run: npm publish ./dist/*.tgz --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
