@@ -29,6 +29,9 @@ struct Cli {
     /// Switch accounts without automatically sending a continuation turn.
     #[arg(long, env = "CODEXMU_NO_RESUME", global = true)]
     no_resume: bool,
+    /// Switch early, between turns, once usage reaches this percent and a cooler account exists (100 = only at the limit).
+    #[arg(long, env="CODEXMU_SWITCH_AT", default_value_t=100, value_parser=clap::value_parser!(u8).range(1..=100), global=true)]
+    switch_at: u8,
     /// Use the unmodified official terminal layout without the codexmu status line.
     #[arg(long, global = true)]
     plain: bool,
@@ -81,6 +84,12 @@ enum Action {
     },
     Switch {
         name: String,
+    },
+    /// Set an account's selection tier; higher tiers are used first (default 0).
+    Priority {
+        name: String,
+        #[arg(allow_negative_numbers = true)]
+        priority: i64,
     },
     Remove {
         name: String,
@@ -150,7 +159,7 @@ fn resolve_binary(binary: &PathBuf) -> Result<PathBuf> {
 
 async fn run(cli: Cli) -> Result<u8> {
     let store = Store::new(home(&cli)?)?;
-    let manager = Manager::new(store.clone(), &cli.usage_url, &cli.token_url)?;
+    let manager = Manager::new(store.clone(), &cli.usage_url, &cli.token_url, cli.switch_at)?;
     match cli.command.unwrap_or(Action::Run { args: cli.args }) {
         Action::Run { args } => {
             #[cfg(unix)]
@@ -211,6 +220,11 @@ async fn run(cli: Cli) -> Result<u8> {
             manager.switch(&name).await?;
             println!("Switched to {name}");
         }
+        Action::Priority { name, priority } => {
+            let _lock = store.lock().await?;
+            store.set_priority(&name, priority)?;
+            println!("Set {name} priority to {priority}");
+        }
         Action::Remove { name } => {
             let _lock = store.lock().await?;
             store.remove(&name)?;
@@ -265,6 +279,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     ("CODEX_HOME", store.home.to_string_lossy().into_owned()),
                     ("CODEXMU_INTERVAL", cli.interval.to_string()),
                     ("CODEXMU_NO_RESUME", cli.no_resume.to_string()),
+                    ("CODEXMU_SWITCH_AT", cli.switch_at.to_string()),
                     ("CODEXMU_USAGE_URL", cli.usage_url),
                     ("CODEXMU_TOKEN_URL", cli.token_url),
                 ] {
@@ -303,7 +318,7 @@ fn main() -> ExitCode {
             let store = Store::new(home(&cli)?)?;
             let args: Vec<_> = std::env::args_os().skip(1).collect();
             if args.iter().any(|a| a == "app-server") {
-                let manager = Manager::new(store, &cli.usage_url, &cli.token_url)?;
+                let manager = Manager::new(store, &cli.usage_url, &cli.token_url, cli.switch_at)?;
                 return bridge::run(manager, cli.codex_bin, args, cli.interval, !cli.no_resume)
                     .await;
             }
@@ -339,6 +354,13 @@ mod tests {
         assert_eq!(cli.args, ["--model", "gpt-5.1", "hello"]);
         let cli = Cli::try_parse_from(["codexmu", "list", "--live"]).unwrap();
         assert!(matches!(cli.command, Some(Action::List { live: true })));
+        let cli = Cli::try_parse_from(["codexmu", "--switch-at", "80", "priority", "work", "-1"])
+            .unwrap();
+        assert!(
+            cli.switch_at == 80
+                && matches!(cli.command, Some(Action::Priority { ref name, priority: -1 }) if name == "work")
+        );
+        assert!(Cli::try_parse_from(["codexmu", "--switch-at", "0"]).is_err());
         let cli = Cli::try_parse_from(["codexmu", "run", "--", "resume", "--last"]).unwrap();
         assert!(matches!(cli.command, Some(Action::Run { args }) if args == ["resume", "--last"]));
     }

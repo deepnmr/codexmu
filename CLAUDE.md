@@ -44,7 +44,7 @@ python3 tests/check.py --native "$(command -v codex)"
 **accounts.rs** — Account and token lifecycle management
 - `Auth`: Wraps auth.json data; validates structure, decodes JWT claims (email, plan, user ID), checks expiration, refreshes OAuth tokens
 - `Store`: File-based account repository; atomic writes prevent corruption; per-account `blocked_until` tracks rate-limit backoff
-- `Manager`: High-level orchestration—refreshes tokens, queries usage API, probes current quotas, picks next account based on available usage percent
+- `Manager`: High-level orchestration—refreshes tokens, queries usage API, probes current quotas, picks next account from the highest `priority` tier with headroom, lowest usage percent within it; `--switch-at` switches early between turns once the active account reaches that percent (tiers only choose the destination; no switch-back to a higher tier). A structured limit error blocks the account until its next reported reset
 - `Usage`: Parses OpenAI's rate-limit windows (primary / secondary, both have percent-used and reset time); considers exhausted if `limit_reached=true` or either window is 100% without reset
 
 **bridge.rs** — JSON-RPC proxy for live app integration
@@ -55,8 +55,8 @@ python3 tests/check.py --native "$(command -v codex)"
 - Handles `account/chatgptAuthTokens/refresh` RPC from app; refreshes stored account and returns new tokens
 
 **main.rs** — CLI and command dispatch
-- Parses global options: `--codex-home`, `--codex-bin`, `--interval`, `--no-resume`
-- Subcommands: `add` (save existing auth.json), `login` (OAuth via official Codex), `list`, `switch`, `remove`, `watch` (poll and rotate auth.json), `app-server` (stdio bridge), `app` (macOS launcher)
+- Parses global options: `--codex-home`, `--codex-bin`, `--interval`, `--no-resume`, `--switch-at`
+- Subcommands: `add` (save existing auth.json), `login` (OAuth via official Codex), `list`, `switch`, `priority` (set selection tier), `remove`, `watch` (poll and rotate auth.json), `app-server` (stdio bridge), `app` (macOS launcher)
 - Bridge auto-launch: sets `CODEXMU_BRIDGE=1` env var; when Codex invokes codexmu as `CODEX_CLI_PATH`, detects this flag and runs bridge mode
 
 ### Key Invariants
@@ -107,7 +107,7 @@ codexmu app-server
 
 ```
 $CODEX_HOME/auth.json                           ← active (swapped atomically)
-$CODEX_HOME/codexmu/accounts/<name>.json        ← per-account auth + blocked_until
+$CODEX_HOME/codexmu/accounts/<name>.json        ← per-account auth + priority + blocked_until
 $CODEX_HOME/codexmu/previous-auth.json          ← backup of prior active
 $CODEX_HOME/codexmu/pending-refresh.json        ← (temp) recovery journal during OAuth
 $CODEX_HOME/codexmu/store.lock                  ← per-operation lock (30s timeout)
@@ -124,6 +124,7 @@ Permissions (Unix): directories 0700, files 0600. Not encrypted on disk; rely on
 | `--codex-bin` | `CODEXMU_CODEX_BIN` | `codex` | Path to official Codex binary |
 | `--interval` | `CODEXMU_INTERVAL` | 60s | Min 5s; watch/app-server polling interval |
 | `--no-resume` | `CODEXMU_NO_RESUME` | false | Skip auto-resume turn after switch |
+| `--switch-at` | `CODEXMU_SWITCH_AT` | 100 | 1–100; switch early once active usage reaches this percent and a cooler account exists |
 | (hidden) `--usage-url` | `CODEXMU_USAGE_URL` | OpenAI endpoint | For testing / alternate endpoints |
 | (hidden) `--token-url` | `CODEXMU_TOKEN_URL` | OAuth token endpoint | For testing |
 

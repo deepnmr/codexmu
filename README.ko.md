@@ -58,7 +58,7 @@ codexmu list --live
 codexmu
 ```
 
-등록된 모든 계정이 자동 전환 후보가 됩니다. 예를 들어 `personal`과 `work`가 차례로 한도에 걸리면 사용 가능한 `extra`로 전환해 같은 대화를 이어갑니다. 전환 순서는 등록 순서가 아니라 남은 사용량에 따라 결정합니다.
+등록된 모든 계정이 자동 전환 후보가 됩니다. 예를 들어 `personal`과 `work`가 차례로 한도에 걸리면 사용 가능한 `extra`로 전환해 같은 대화를 이어갑니다. 전환 순서는 등록 순서가 아니라 남은 사용량에 따라 결정합니다. 특정 계정을 먼저 쓰려면 `codexmu priority NAME 1`로 높은 등급을 주세요. 사용량은 같은 등급 안에서만 비교하며, 위 등급의 계정이 모두 사용 불가능할 때만 아래 등급을 사용합니다. `codexmu priority personal -1`은 `personal`을 예비 계정으로 남깁니다. 등급은 전환할 때 목적지를 정할 뿐이며, 활성 계정에 여유가 남아 있는 동안 상위 등급으로 되돌아가지는 않습니다.
 
 `login`은 임시 `CODEX_HOME`에서 공식 `codex login`을 실행합니다. 로그인 취소·실패 시 기존 활성 계정은 그대로 유지됩니다. 브라우저 로그인을 쓰려면 `--device-auth`를 생략하세요. 키체인에만 저장되어 `auth.json`이 없다면 `add` 대신 `login`을 사용하세요.
 
@@ -128,7 +128,8 @@ codexmu --codex-bin /absolute/path/to/codex app
 
 - 기본 60초마다 **턴이 실행 중이지 않을 때** 사용량을 조회합니다.
 - `usageLimitExceeded`로 턴이 끝나면 다음 주기를 기다리지 않고 다른 계정을 찾습니다.
-- 사용 가능한 계정 중 응답에 포함된 사용량 창의 최대 사용률이 가장 낮은 계정을 선택합니다.
+- 가장 높은 우선순위 등급의 사용 가능한 계정 중 응답에 포함된 사용량 창의 최대 사용률이 가장 낮은 계정을 선택합니다.
+- `--switch-at 80`을 주면 활성 계정이 80%에 도달하고 80% 미만인 계정이 있을 때 턴 사이에 미리 전환합니다. 선제 전환은 제외 시간을 두지 않고 계속 진행 턴도 보내지 않습니다.
 - 새 인증은 `account/login/start`로 실행 중인 공식 app-server에 전달합니다. 파일만 교체하고 끝내지 않습니다.
 - 기본적으로 같은 스레드에 계속 진행하라는 새 턴을 보냅니다. 원래 프롬프트나 실행한 도구 호출을 재전송하지 않습니다.
 - 다른 턴이 실행 중이면 전환을 미룹니다. 전환 중 들어온 새 턴은 잠시 대기하고, 승인 응답은 계속 전달합니다. 취소된 대기 턴은 실행하지 않습니다.
@@ -166,7 +167,7 @@ codexmu app-server -- --stdio
 
 ```text
 $CODEX_HOME/auth.json                       활성 Codex 인증
-$CODEX_HOME/codexmu/accounts/<name>.json     계정별 인증·일시 제외 시각
+$CODEX_HOME/codexmu/accounts/<name>.json     계정별 인증·우선순위·일시 제외 시각
 $CODEX_HOME/codexmu/previous-auth.json       직전 활성 인증 백업
 $CODEX_HOME/codexmu/pending-refresh.json     중단된 OAuth 갱신 복구용 임시 기록
 $CODEX_HOME/codexmu/terminal-<PID>.log       세션별 공식 서버 진단 로그
@@ -180,8 +181,9 @@ $CODEX_HOME/codexmu/terminal-<PID>.log       세션별 공식 서버 진단 로�
 | `--codex-bin` | `CODEXMU_CODEX_BIN` | `codex` |
 | `--interval` | `CODEXMU_INTERVAL` | 60초, 최소 5초 |
 | `--no-resume` | `CODEXMU_NO_RESUME` | false |
+| `--switch-at` | `CODEXMU_SWITCH_AT` | 100 (한도 도달 시에만 전환); 1–100 |
 
-사용량 요청 실패·유효한 사용량 창이 없는 응답·이미 지난 리셋 시각을 여유 계정의 증거로 사용하지 않습니다. 한도에 도달한 계정은 최소 60초 동안 후보에서 제외됩니다. `--dry-run`은 계정 전환을 하지 않지만 정상 인증 유지에 필요한 OAuth 갱신은 할 수 있습니다.
+사용량 요청 실패·유효한 사용량 창이 없는 응답·이미 지난 리셋 시각을 여유 계정의 증거로 사용하지 않습니다. 한도에 도달한 계정은 최소 60초 동안, `usageLimitExceeded` 오류를 받은 계정은 사용량 보고에 여유가 있어 보여도 다음 리셋 시각까지 후보에서 제외됩니다. `--dry-run`은 계정 전환을 하지 않지만 정상 인증 유지에 필요한 OAuth 갱신은 할 수 있습니다.
 
 ## 검증
 
