@@ -151,6 +151,9 @@ pub struct Account {
     pub auth: Auth,
     #[serde(default)]
     pub blocked_until: i64,
+    /// Higher tiers are chosen first; usage decides only within a tier.
+    #[serde(default)]
+    pub priority: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -326,7 +329,17 @@ impl Store {
             name: name.to_owned(),
             auth,
             blocked_until: 0,
+            priority: 0,
         })
+    }
+    pub fn set_priority(&self, name: &str, priority: i64) -> Result<()> {
+        let mut account = self
+            .all()?
+            .into_iter()
+            .find(|a| a.name == name)
+            .ok_or("unknown account")?;
+        account.priority = priority;
+        self.save(&account)
     }
     pub fn remove(&self, name: &str) -> Result<()> {
         let current = self.active_auth()?.map(|a| a.identity()).transpose()?;
@@ -425,6 +438,16 @@ impl Usage {
             .flatten()
             .any(|w| w.used_percent == 100.0 && w.reset_at.is_none_or(|t| t > now()))
     }
+    pub fn reset_at(&self) -> Option<i64> {
+        [
+            &self.rate_limit.primary_window,
+            &self.rate_limit.secondary_window,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.reset_at)
+        .min()
+    }
     pub fn available(&self) -> Option<f64> {
         if self.exhausted() {
             None
@@ -441,6 +464,7 @@ pub struct Manager {
     client: Client,
     usage_url: Url,
     token_url: Url,
+    switch_at: f64,
 }
 
 fn endpoint(value: &str) -> Result<Url> {
@@ -461,7 +485,7 @@ fn endpoint(value: &str) -> Result<Url> {
 }
 
 impl Manager {
-    pub fn new(store: Store, usage: &str, token: &str) -> Result<Self> {
+    pub fn new(store: Store, usage: &str, token: &str, switch_at: u8) -> Result<Self> {
         Ok(Self {
             store,
             updates: None,
@@ -472,6 +496,7 @@ impl Manager {
                 .build()?,
             usage_url: endpoint(usage)?,
             token_url: endpoint(token)?,
+            switch_at: f64::from(switch_at),
         })
     }
     pub fn activated(&self, account: &Account) {
@@ -607,7 +632,17 @@ impl Manager {
         }
         self.store.activate(&account)
     }
+    /// A limit outranks the usage report: exclude the account until its next reported reset.
+    async fn limit(&self, account: &mut Account) -> Result<()> {
+        let reset = match self.usage(account).await {
+            Ok(usage) => usage.reset_at(),
+            Err(_) => None,
+        };
+        account.blocked_until = reset.unwrap_or(0).max(now() + 60);
+        self.store.save(account)
+    }
     /// Probe current quota, or rotate after a structured limit error from this account.
+    /// Below a real limit, switch early once usage reaches `switch_at` and a cooler account exists.
     pub async fn prepare(&self, limited_account: Option<&str>, dry_run: bool) -> Result<Account> {
         let _lock = self.store.lock().await?;
         let mut active = self.store.active()?;
@@ -617,46 +652,51 @@ impl Manager {
             && !dry_run
             && let Some(mut account) = self.store.all()?.into_iter().find(|a| a.name == limited)
         {
-            account.blocked_until = now() + 60;
-            self.store.save(&account)?;
+            self.limit(&mut account).await?;
         }
-        let exhausted = if forced {
-            true
+        // Candidates must stay below this ceiling: any headroom after a limit, the threshold otherwise.
+        let ceiling = if forced {
+            100.0
         } else {
             match self.usage(&mut active).await {
-                Ok(usage) => usage.exhausted(),
+                Ok(usage) if usage.exhausted() => 100.0,
+                Ok(usage) => match usage.used() {
+                    Some(used) if used >= self.switch_at => self.switch_at,
+                    _ => return Ok(active),
+                },
                 Err(error) => {
                     self.notice(format!("{} usage unavailable: {error}", active.name));
                     return Ok(active);
                 }
             }
         };
-        if !exhausted {
-            return Ok(active);
+        if ceiling >= 100.0 && !dry_run {
+            self.limit(&mut active).await?;
         }
-        if !dry_run {
-            active.blocked_until = now() + 60;
-            self.store.save(&active)?;
-        }
-        let mut best: Option<(Account, f64)> = None;
+        let mut candidates = Vec::new();
         // ponytail: serial account probes; use bounded concurrency if large account pools need it.
         for mut account in self.store.all()? {
             if account.name == active.name || account.blocked_until > now() {
                 continue;
             }
             match self.usage(&mut account).await {
-                Ok(usage) => {
-                    if let Some(used) = usage.available()
-                        && best.as_ref().is_none_or(|(_, current)| used < *current)
-                    {
-                        best = Some((account, used));
-                    }
-                }
+                Ok(usage) => candidates.extend(usage.available().map(|used| (account, used))),
                 Err(error) => self.notice(format!("{} skipped: {error}", account.name)),
             }
         }
-        let Some((next, _)) = best else {
-            self.notice("no available account; waiting for quota reset".to_owned());
+        // Highest tier first, lowest usage within it. Prefer accounts under the threshold so the
+        // next check does not move again at once; at a real limit any headroom will do.
+        let pick = |ceiling: f64| {
+            candidates
+                .iter()
+                .filter(|(_, used)| *used < ceiling)
+                .min_by(|(a, x), (b, y)| b.priority.cmp(&a.priority).then(x.total_cmp(y)))
+                .map(|(account, _)| account.clone())
+        };
+        let Some(next) = pick(self.switch_at).or_else(|| pick(ceiling)) else {
+            if ceiling >= 100.0 {
+                self.notice("no available account; waiting for quota reset".to_owned());
+            }
             return Ok(active);
         };
         if dry_run {
@@ -683,7 +723,7 @@ impl Manager {
         let mut rows = Vec::new();
         for mut account in self.store.all()? {
             let mut row = json!({"name":account.name, "email":account.auth.email(), "plan":account.auth.plan(),
-                "active":account.auth.identity().ok() == active, "blocked_until":account.blocked_until});
+                "active":account.auth.identity().ok() == active, "blocked_until":account.blocked_until, "priority":account.priority});
             if live {
                 match self.usage(&mut account).await {
                     Ok(usage) => row["usage"] = serde_json::to_value(usage)?,

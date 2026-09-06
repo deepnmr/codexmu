@@ -58,7 +58,7 @@ codexmu list --live
 codexmu
 ```
 
-All registered accounts are candidates for automatic switching. For example, if `personal` and then `work` reach their limits, codexmu can switch to an available `extra` account and continue the same conversation. Selection depends on remaining usage, not registration order.
+All registered accounts are candidates for automatic switching. For example, if `personal` and then `work` reach their limits, codexmu can switch to an available `extra` account and continue the same conversation. Selection depends on remaining usage, not registration order. To prefer some accounts, give them a higher tier with `codexmu priority NAME 1`; usage decides only within a tier, and lower tiers are used once every account above them is unavailable. `codexmu priority personal -1` keeps `personal` as the reserve. Tiers decide where a switch goes; codexmu does not move back to a higher tier while the active account still has headroom.
 
 `login` runs official `codex login` in a temporary `CODEX_HOME`. Cancelling or failing login preserves the existing active account. Omit `--device-auth` for browser login. If your credentials exist only in the keychain and there is no `auth.json`, use `login` instead of `add`.
 
@@ -86,7 +86,7 @@ The image is a Terminal.app capture of a local fake-account run.
  codexmu │ gpt-5.1 medium │ …/codexmu │ main +2 │ 5h 85% · 0h42m │ user@example.com (plus)   Context 100% left · Fast off · 5h 85% · weekly 58% · 0.153.4
 ```
 
-The status line shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the status line updates and briefly shows a switch notice segment. Unavailable quota data appears as `—`; narrow windows shorten or hide path, Git, and native details. The mouse wheel scrolls the Codex output while the status line stays in place; press any key to jump back to the live view. Because codexmu captures the wheel, hold Option (macOS Terminal, iTerm2) or Shift (kitty, Ghostty, most Linux terminals) while dragging to select text. Your terminal controls the background and font.
+The status line shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the status line updates and briefly shows a switch notice segment. Unavailable quota data appears as `—`; narrow windows shorten or hide path, Git, and native details. The mouse wheel and PageUp/PageDown scroll the Codex output while the status line stays in place; any other key jumps back to the live view. codexmu never captures the mouse, so selecting text, copying, and Cmd+click keep working exactly as in your terminal (wheel scrolling relies on the alternate-scroll behavior that Terminal.app, iTerm2, kitty, Ghostty, and WezTerm enable by default). Your terminal controls the background and font.
 
 ```sh
 codexmu
@@ -104,7 +104,7 @@ Account-store access, usage queries, and OAuth refresh are serialized by a store
 
 A separate startup lock serializes server startup through the initialization response to avoid official Codex SQLite initialization conflicts in a fresh home. It releases immediately after initialization so sessions can work concurrently.
 
-codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and codexmu composes the PTY display on an alternate screen with its own scrollback, so the status line stays pinned while you scroll the Codex output. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use `--plain` when you need the terminal's native scrollback and mouse selection instead.
+codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and codexmu composes the PTY display on an alternate screen with its own scrollback, so the status line stays pinned while you scroll the Codex output. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use `--plain` when you need the terminal's native scrollback instead.
 
 Pass Codex options after `run --` to avoid confusion with management commands and options. codexmu manages the `--remote` address. Use `codexmu --no-resume` to disable automatic continuation.
 
@@ -128,7 +128,8 @@ Terminal and desktop modes share the same switching behavior:
 
 - Query usage every 60 seconds by default, **only when no turn is running**.
 - Look for another account immediately when a turn ends with `usageLimitExceeded`.
-- Among available accounts, select the one with the lowest maximum usage across the usage windows present in the response.
+- Among available accounts in the highest priority tier, select the one with the lowest maximum usage across the usage windows present in the response.
+- With `--switch-at 80`, also switch between turns once the active account reaches 80% and an account below 80% exists. An early switch is not a cooldown and sends no continuation turn.
 - Send new credentials to the running official app-server through `account/login/start`, rather than only replacing a file.
 - By default, send a new continuation turn in the same thread. Do not replay the original prompt or executed tool calls.
 - Defer switching while another turn is running. Queue new turns during a switch while continuing to forward approval responses. Do not execute cancelled queued turns.
@@ -166,7 +167,7 @@ You do not need a separate `codexmu watch` when running `codexmu`. A duplicate `
 
 ```text
 $CODEX_HOME/auth.json                       Active Codex authentication
-$CODEX_HOME/codexmu/accounts/<name>.json     Account credentials and temporary exclusion time
+$CODEX_HOME/codexmu/accounts/<name>.json     Account credentials, priority, and temporary exclusion time
 $CODEX_HOME/codexmu/previous-auth.json       Previous active authentication backup
 $CODEX_HOME/codexmu/pending-refresh.json     Interrupted OAuth refresh recovery journal
 $CODEX_HOME/codexmu/terminal-<PID>.log        Per-session official server diagnostics
@@ -180,8 +181,9 @@ $CODEX_HOME/codexmu/terminal-<PID>.log        Per-session official server diagno
 | `--codex-bin` | `CODEXMU_CODEX_BIN` | `codex` |
 | `--interval` | `CODEXMU_INTERVAL` | 60 seconds; minimum 5 |
 | `--no-resume` | `CODEXMU_NO_RESUME` | false |
+| `--switch-at` | `CODEXMU_SWITCH_AT` | 100 (switch only at the limit); 1–100 |
 
-Failed usage requests, responses without a valid usage window, and past reset timestamps are not treated as evidence of available quota. Accounts that reach their limits are excluded from selection for at least 60 seconds. `--dry-run` does not switch accounts, but may refresh OAuth tokens to keep credentials valid.
+Failed usage requests, responses without a valid usage window, and past reset timestamps are not treated as evidence of available quota. Accounts that reach their limits are excluded from selection for at least 60 seconds, and after a `usageLimitExceeded` error until the next reported usage reset, even if the usage report still shows headroom. `--dry-run` does not switch accounts, but may refresh OAuth tokens to keep credentials valid.
 
 ## Validation
 

@@ -418,13 +418,159 @@ fn csi_params(bytes: &[u8]) -> Vec<usize> {
         .collect()
 }
 
+// Terminals send wheel motion on the alternate screen as bursts of arrow keys. A burst scrolls the
+// mirror, a lone arrow reaches Codex after a short hold, and any other key jumps back to the live view.
+const HOLD: Duration = Duration::from_millis(20);
+const SEQUENCES: [&[u8]; 8] = [
+    b"\x1b[A",
+    b"\x1b[B",
+    b"\x1bOA",
+    b"\x1bOB",
+    b"\x1b[5~",
+    b"\x1b[6~",
+    b"\x1b[200~",
+    b"\x1b[201~",
+];
+
+#[derive(Default)]
+struct Input {
+    pending: Vec<u8>,
+    pending_at: Option<Instant>,
+    held: Vec<u8>,
+    held_up: bool,
+    held_at: Option<Instant>,
+    pasting: bool,
+}
+
+impl Input {
+    // Returns bytes for Codex and lines to scroll (positive scrolls into history).
+    fn feed(
+        &mut self,
+        chunk: &[u8],
+        now: Instant,
+        scrolled: bool,
+        native: bool,
+        page: isize,
+    ) -> (Vec<u8>, isize) {
+        let mut bytes = std::mem::take(&mut self.pending);
+        self.pending_at = None;
+        bytes.extend_from_slice(chunk);
+        let mut forward = Vec::new();
+        let mut scroll = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            let rest = &bytes[i..];
+            if self.pasting {
+                let found = rest.windows(6).position(|w| w == b"\x1b[201~");
+                let end = found.map_or(rest.len(), |p| p + 6);
+                self.pasting = found.is_none();
+                forward.extend_from_slice(&rest[..end]);
+                i += end;
+                continue;
+            }
+            if rest[0] != 0x1b {
+                forward.extend(self.release());
+                forward.push(rest[0]);
+                i += 1;
+                continue;
+            }
+            let Some(sequence) = SEQUENCES.iter().find(|s| rest.starts_with(s)) else {
+                if rest.len() < 6 && SEQUENCES.iter().any(|s| s.starts_with(rest)) {
+                    self.pending = rest.to_vec();
+                    self.pending_at = Some(now);
+                    break;
+                }
+                forward.extend(self.release());
+                forward.push(0x1b);
+                i += 1;
+                continue;
+            };
+            i += sequence.len();
+            let arrow = match *sequence {
+                b"\x1b[200~" => {
+                    self.pasting = true;
+                    forward.extend(self.release());
+                    forward.extend_from_slice(sequence);
+                    continue;
+                }
+                b"\x1b[5~" if !native => {
+                    scroll += page;
+                    continue;
+                }
+                b"\x1b[6~" if !native && scrolled => {
+                    scroll -= page;
+                    continue;
+                }
+                b"\x1b[A" | b"\x1bOA" => Some(true),
+                b"\x1b[B" | b"\x1bOB" => Some(false),
+                _ => None,
+            };
+            let Some(up) = arrow.filter(|_| !native) else {
+                forward.extend(self.release());
+                forward.extend_from_slice(sequence);
+                continue;
+            };
+            let step = if up { 1 } else { -1 };
+            if scrolled || scroll != 0 {
+                scroll += step;
+                continue;
+            }
+            match self.held_at {
+                Some(at) if self.held_up == up && now.duration_since(at) <= HOLD => {
+                    scroll += step * (self.held.len() / 3 + 1) as isize;
+                    self.held.clear();
+                    self.held_at = None;
+                }
+                _ => {
+                    forward.extend(self.release());
+                    self.held = sequence.to_vec();
+                    self.held_up = up;
+                    self.held_at = Some(now);
+                }
+            }
+        }
+        (forward, scroll)
+    }
+
+    fn release(&mut self) -> Vec<u8> {
+        self.held_at = None;
+        std::mem::take(&mut self.held)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.held_at
+            .into_iter()
+            .chain(self.pending_at)
+            .min()
+            .map(|at| at + HOLD)
+    }
+
+    fn expire(&mut self, now: Instant) -> Vec<u8> {
+        let mut forward = Vec::new();
+        if self
+            .held_at
+            .is_some_and(|at| now.duration_since(at) >= HOLD)
+        {
+            forward.extend(self.release());
+        }
+        if self
+            .pending_at
+            .is_some_and(|at| now.duration_since(at) >= HOLD)
+        {
+            self.pending_at = None;
+            forward.extend(std::mem::take(&mut self.pending));
+        }
+        forward
+    }
+}
+
 pub struct View {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: mpsc::Receiver<Vec<u8>>,
     mirror: Mirror,
-    input_pending: Vec<u8>,
+    keys: Input,
     native: String,
     previous: Vec<String>,
     status: Status,
@@ -486,7 +632,7 @@ impl View {
             writer,
             output,
             mirror: Mirror::new(size.rows, size.cols),
-            input_pending: Vec::new(),
+            keys: Input::default(),
             native: String::new(),
             previous: Vec::new(),
             status: Status {
@@ -503,7 +649,8 @@ impl View {
             terminal::EnterAlternateScreen,
             cursor::Hide
         )?;
-        std::io::stdout().write_all(b"\x1b[?1000h\x1b[?1006h")?;
+        // Application cursor keys: Terminal.app turns wheel motion into arrow keys only in this mode.
+        std::io::stdout().write_all(b"\x1b[?1h\x1b[?1007h")?;
         view.draw()?;
         Ok(view)
     }
@@ -520,8 +667,16 @@ impl View {
                 n = self.input.read(&mut bytes) => {
                     let n = n?;
                     if n == 0 { return Ok(0); }
-                    self.handle_input(&bytes[..n])?;
+                    let screen = self.mirror.screen();
+                    let (native, page) = (screen.alternate_screen(), screen.size().0 as isize - 1);
+                    let (forward, scroll) = self.keys.feed(&bytes[..n], Instant::now(), self.mirror.offset > 0, native, page);
+                    self.mirror.scroll(scroll);
+                    self.forward(&forward)?;
                     dirty = true;
+                }
+                _ = tokio::time::sleep_until(self.keys.deadline().unwrap_or(Instant::now()).into()), if self.keys.deadline().is_some() => {
+                    let forward = self.keys.expire(Instant::now());
+                    self.forward(&forward)?;
                 }
                 output = self.output.recv() => match output {
                     Some(bytes) => {
@@ -563,57 +718,14 @@ impl View {
         }
     }
 
-    // Wheel events scroll the mirror; every other key jumps back to the live view and reaches Codex.
-    fn handle_input(&mut self, chunk: &[u8]) -> Result<()> {
-        let mut bytes = std::mem::take(&mut self.input_pending);
-        bytes.extend_from_slice(chunk);
-        let mut forward = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == 0x1b && bytes[i + 1..].starts_with(b"[<") {
-                match bytes[i + 3..].iter().position(|b| matches!(b, b'M' | b'm')) {
-                    Some(p) => {
-                        let end = i + 3 + p;
-                        self.mouse(&csi_params(&bytes[i + 3..end]), &mut forward);
-                        i = end + 1;
-                        continue;
-                    }
-                    None if bytes.len() - i < 24 => {
-                        self.input_pending = bytes[i..].to_vec();
-                        break;
-                    }
-                    None => {}
-                }
-            } else if bytes[i] == 0x1b && bytes[i + 1..] == *b"[" {
-                self.input_pending = bytes[i..].to_vec();
-                break;
-            }
-            forward.push(bytes[i]);
-            i += 1;
+    fn forward(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
         }
-        if !forward.is_empty() {
-            self.mirror.offset = 0;
-            self.writer.write_all(&forward)?;
-            self.writer.flush()?;
-        }
+        self.mirror.offset = 0;
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
         Ok(())
-    }
-
-    fn mouse(&mut self, params: &[usize], forward: &mut Vec<u8>) {
-        let button = params.first().copied().unwrap_or(0);
-        if button & 64 == 0 {
-            return;
-        }
-        let up = button & 3 == 0;
-        if self.mirror.screen().alternate_screen() {
-            forward.extend(if up {
-                b"\x1b[A\x1b[A\x1b[A"
-            } else {
-                b"\x1b[B\x1b[B\x1b[B"
-            });
-        } else {
-            self.mirror.scroll(if up { 3 } else { -3 });
-        }
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -698,8 +810,7 @@ impl Drop for View {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::io::stdout()
-            .write_all(b"\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?2026l\x1b[?7h");
+        let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[?1l\x1b[?2004l\x1b[?2026l\x1b[?7h");
         let _ = execute!(
             std::io::stdout(),
             cursor::Show,
@@ -831,6 +942,105 @@ mod tests {
         assert_eq!(visible_width("\x1b[38;5;111mab\x1b[0m"), 2);
         assert_eq!(clip("ab\x1b\ncd", 3), "ab…");
         assert!(clip("한국어", 4).width() <= 4);
+        state.update(Update::Notice("switched a -> b".into()));
+        assert!(
+            state
+                .footer("Context 50% left", 200)
+                .contains("switched a -> b")
+        );
+    }
+
+    #[test]
+    fn wheel_bursts_scroll_while_lone_arrows_reach_codex() {
+        let mut keys = Input::default();
+        let t0 = Instant::now();
+        // A wheel notch arrives as three arrows within a millisecond: scroll, forward nothing.
+        assert_eq!(
+            keys.feed(b"\x1bOA\x1bOA\x1bOA", t0, false, false, 10),
+            (vec![], 3)
+        );
+        // A lone arrow is held, then released to Codex once the hold window passes.
+        assert_eq!(keys.feed(b"\x1bOA", t0, false, false, 10), (vec![], 0));
+        assert!(keys.expire(t0 + Duration::from_millis(5)).is_empty());
+        assert_eq!(keys.expire(t0 + HOLD), b"\x1bOA");
+        // A second same-direction arrow inside the window turns the held one into a scroll.
+        assert_eq!(keys.feed(b"\x1b[B", t0, false, false, 10), (vec![], 0));
+        assert_eq!(
+            keys.feed(b"\x1b[B", t0 + Duration::from_millis(10), false, false, 10),
+            (vec![], -2)
+        );
+        // Other keys release the held arrow first and are forwarded in order.
+        assert_eq!(keys.feed(b"\x1bOA", t0, false, false, 10), (vec![], 0));
+        assert_eq!(
+            keys.feed(b"x", t0, false, false, 10),
+            (b"\x1bOAx".to_vec(), 0)
+        );
+        // While scrolled, arrows and paging scroll immediately; pasted arrows pass through.
+        assert_eq!(
+            keys.feed(b"\x1bOB\x1b[6~", t0, true, false, 10),
+            (vec![], -11)
+        );
+        assert_eq!(
+            keys.feed(b"\x1b[200~\x1bOA\x1bOA\x1b[201~", t0, false, false, 10)
+                .0,
+            b"\x1b[200~\x1bOA\x1bOA\x1b[201~"
+        );
+        // Codex's own alternate screen (transcript view) gets every key untouched.
+        assert_eq!(
+            keys.feed(b"\x1bOA\x1bOA", t0, false, true, 10),
+            (b"\x1bOA\x1bOA".to_vec(), 0)
+        );
+        // A split sequence waits for its tail; a lone Escape is released after the window.
+        assert_eq!(keys.feed(b"\x1bO", t0, false, false, 10), (vec![], 0));
+        assert_eq!(keys.feed(b"A\x1bOA", t0, false, false, 10), (vec![], 2));
+        assert_eq!(keys.feed(b"\x1b", t0, false, false, 10), (vec![], 0));
+        assert_eq!(keys.expire(t0 + HOLD), b"\x1b");
+    }
+
+    #[test]
+    fn mirror_keeps_rows_dropped_by_top_pinned_scroll_regions() {
+        fn plain(line: &str) -> String {
+            let mut out = String::new();
+            let mut escape = false;
+            for c in line.chars() {
+                if c == '\x1b' {
+                    escape = true;
+                }
+                if !escape {
+                    out.push(c);
+                }
+                if escape && c == 'm' {
+                    escape = false;
+                }
+            }
+            out.trim_end().to_owned()
+        }
+        let mut mirror = Mirror::new(6, 20);
+        mirror.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        // Codex inserts history: pin rows 1-4, newline at the region bottom, then scroll up twice.
+        mirror.feed(b"\x1b[1;4r\x1b[4;1H\r\nseven\x1b[2S\x1b[r");
+        let history: Vec<String> = mirror.history.iter().map(|l| plain(l)).collect();
+        assert_eq!(history, ["one", "two", "three"]);
+        assert_eq!(
+            mirror.screen().rows(0, 20).nth(5).unwrap().trim_end(),
+            "six"
+        );
+        // A split escape sequence and a scroll inside a region that is not pinned to the top are ignored.
+        mirror.feed(b"\x1b[3;6r\x1b[6;1H\x1b");
+        mirror.feed(b"D");
+        assert_eq!(mirror.history.len(), 3);
+        // The scrolled view stays anchored while new rows keep arriving.
+        mirror.scroll(3);
+        assert_eq!(mirror.offset, 3);
+        mirror.feed(b"\x1b[r\x1b[6;1H\n");
+        assert_eq!((mirror.history.len(), mirror.offset), (4, 4));
+        // Terminal probes are answered in the mirror's coordinates, even when split across chunks.
+        let mut parser = vt100::Parser::new_with_callbacks(20, 80, 0, Callbacks::default());
+        parser.process(b"\x1b[3;4H\x1b[");
+        parser.process(b"6n");
+        assert_eq!(parser.callbacks().replies, b"\x1b[3;4R");
+        // A switch notice becomes a status line segment.
+        let mut state = Status::default();
         state.update(Update::Notice("switched a -> b".into()));
         assert!(
             state

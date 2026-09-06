@@ -254,10 +254,73 @@ def main():
         before = (root / "home/auth.json").read_bytes()
         run("watch", "--once")
         assert (root / "home/auth.json").read_bytes() == before
+        def unblock():
+            # Clear persisted cooldowns from the prior independent scenarios.
+            for path in (root / "home/codexmu/accounts").glob("*.json"):
+                value = json.loads(path.read_text()); value["blocked_until"] = 0; path.write_text(json.dumps(value))
+
+        def active():
+            return json.loads((root / "home/auth.json").read_text())["tokens"]["account_id"]
+
+        # Priority tiers win over usage; an exhausted tier falls through to the next one.
+        usage.update(a=100, b=15, c=50)
+        unblock(); run("switch", "a")
+        run("priority", "c", "1")
+        assert [row["priority"] for row in json.loads(run("list").stdout)["accounts"]] == [0, 0, 1]
+        run("watch", "--once")
+        assert active() == "c"
+        usage.update(a=100, b=15, c=100)
+        unblock(); run("switch", "a")
+        run("watch", "--once")
+        assert active() == "b"
+        # At the limit, a cool lower-tier account beats a hot top-tier one so the next check does not move again.
+        usage.update(a=100, b=15, c=65)
+        unblock(); run("switch", "a")
+        run("--switch-at", "60", "watch", "--once")
+        assert active() == "b"
+        run("--switch-at", "60", "watch", "--once")
+        assert active() == "b"
+        # Only hot candidates left: any headroom beats waiting at the limit.
+        usage.update(a=100, b=65, c=65)
+        unblock(); run("switch", "a")
+        run("--switch-at", "60", "watch", "--once")
+        assert active() == "c"
+        # A refresh round-trip must not drop the tier.
+        http_errors["c"] = 401
+        run("list", "--live")
+        assert [row["priority"] for row in json.loads(run("list").stdout)["accounts"]] == [0, 0, 1]
+        run("priority", "c", "0")
+        run("priority", "missing", "1", ok=False)
+        # Proactive switching needs both the active account at/above the threshold and a candidate below it.
+        usage.update(a=70, b=15, c=50)
+        unblock(); run("switch", "a")
+        run("watch", "--once")
+        run("--switch-at", "60", "watch", "--once", "--dry-run")
+        assert active() == "a"
+        run("--switch-at", "60", "watch", "--once")
+        assert active() == "b"
+        assert json.loads((root / "home/codexmu/accounts/a.json").read_text())["blocked_until"] == 0  # early switch is not a cooldown
+        usage.update(a=70, b=65, c=65)
+        unblock(); run("switch", "a")
+        assert "no available account" not in run("--switch-at", "60", "watch", "--once").stderr
+        assert active() == "a"
+        # In a live bridge an early switch happens between turns and sends no continuation turn.
+        usage.update(a=70, b=15, c=50)
+        unblock(); run("switch", "a")
+        (root / "log").write_text("")
+        peer = Peer([str(binary), "--switch-at", "60", "app-server"], dict(env, FAKE_LIMITED_ACCOUNTS=""))
+        try:
+            peer.send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "early", "version": "1"}}})
+            peer.until(lambda v: v.get("id") == 1)
+            peer.send({"method": "initialized"})
+            peer.until(lambda v: v.get("method") == "account/updated" and v["params"]["account"] == "b")
+        finally:
+            peer.close()
+        early = [json.loads(line) for line in (root / "log").read_text().splitlines()]
+        assert [v["params"]["chatgptAccountId"] for v in early if v.get("method") == "account/login/start"] == ["a", "b"]
+        assert not any(v.get("method") == "turn/start" for v in early)
         usage.update(a=0, b=15, c=50)
-        # Clear persisted cooldowns from the prior independent scenarios.
-        for path in (root / "home/codexmu/accounts").glob("*.json"):
-            value = json.loads(path.read_text()); value["blocked_until"] = 0; path.write_text(json.dumps(value))
+        unblock()
         run("switch", "a")
         peer = Peer([str(binary), "app-server"], env)
         try:
@@ -273,6 +336,8 @@ def main():
             done = peer.until(lambda v: v.get("method") == "turn/completed")
             assert done["params"]["turn"]["status"] == "completed"
             assert json.loads((root / "home/auth.json").read_text())["tokens"]["account_id"] == "b"
+            # The usage report said A was fine; the limit error still excludes A until its next reset.
+            assert json.loads((root / "home/codexmu/accounts/a.json").read_text())["blocked_until"] > time.time() + 300
             peer.send({"id": 3, "method": "fake/refresh"})
             peer.until(lambda v: v.get("method") == "fake/refreshed")
             peer.send({"id": 4, "method": "account/read"})
@@ -340,7 +405,7 @@ def main():
                 probe_gate = None
                 peer.close()
             assert sum(json.loads(line).get("method") == "turn/start" for line in (root / "log").read_text().splitlines()) == 1
-        print("PASS: account CRUD, private atomic switch, dry run, HTTP failure, OAuth refresh, exhausted pool, RPC IDs, limit failover, same-thread continuation, approvals, token redaction, locking")
+        print("PASS: account CRUD, private atomic switch, dry run, HTTP failure, OAuth refresh, exhausted pool, priority tiers, early switching, RPC IDs, limit failover, same-thread continuation, approvals, token redaction, locking")
         if "--native" in sys.argv:
             native = str(Path(sys.argv[sys.argv.index("--native") + 1]).resolve())
             usage.update(a=0, b=15, c=50)
