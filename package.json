@@ -1,6 +1,6 @@
 {
   "name": "codexmu",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Multi-account manager and automatic account switching for Codex",
   "license": "MIT",
   "type": "module",
