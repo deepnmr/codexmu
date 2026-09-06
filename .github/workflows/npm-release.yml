@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish to npm (requires NPM_TOKEN)
+        description: Publish to npm (trusted publishing via GitHub OIDC)
         type: boolean
         default: false
 
@@ -51,6 +51,9 @@ jobs:
   package:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -75,5 +78,3 @@ jobs:
           if-no-files-found: error
       - if: inputs.publish
         run: npm publish ./dist/*.tgz --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
