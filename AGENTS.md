@@ -16,7 +16,7 @@ are deliberately unsupported.
 - `src/bridge.rs`: JSON-RPC forwarding, live authentication, queued turns,
   approval forwarding, and continuation after structured usage-limit errors.
 - `src/terminal.rs`: Unix socket transport, native terminal lifecycle, and cleanup.
-- `src/dashboard.rs`: PTY rendering, status header, resizing, and Git status.
+- `src/dashboard.rs`: PTY compositing with its own scrollback, mouse wheel scrolling, pinned status line, resizing, and Git status.
 - `tests/check.py`: local fake-account integration checks; optional native Codex checks.
 - `tests/terminal.py`: official Codex PTY checks using local fake inference.
 - `bin/codexmu.mjs`: Node.js 24+ entry point that replaces itself with the native binary.
