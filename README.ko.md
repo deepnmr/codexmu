@@ -86,7 +86,7 @@ codexmu remove unused
  codexmu │ gpt-5.1 medium │ …/codexmu │ main +2 │ 5h 85% · 0h42m │ user@example.com (plus)   Context 100% left · Fast off · 5h 85% · weekly 58% · 0.153.4
 ```
 
-표시되는 값은 현재 세션의 모델·추론 강도·작업 경로, Git 브랜치와 변경 수, 실제 조회한 남은 사용량, 활성 계정의 이메일·플랜입니다. 상태 줄의 시간은 한도 초기화까지 남은 시간입니다. 계정 전환이 서버에서 승인되면 상태 줄도 새 계정으로 바뀌고 전환 알림 구간을 잠시 표시합니다. 조회되지 않은 한도는 `—`로 표시하며, 좁은 창에서는 경로·Git 표시를 줄입니다. 마우스 휠과 PageUp/PageDown으로 Codex 출력만 스크롤되고 상태 줄은 그대로 남으며, 다른 키를 누르면 현재 화면으로 돌아옵니다. codexmu는 마우스를 가로채지 않으므로 텍스트 선택·복사·Cmd+클릭은 터미널 기본 동작 그대로입니다(휠 스크롤은 Terminal.app, iTerm2, kitty, Ghostty, WezTerm이 기본으로 켜 두는 alternate scroll 동작을 이용합니다). 배경·글꼴은 사용하는 터미널 설정을 따릅니다.
+표시되는 값은 현재 세션의 모델·추론 강도·작업 경로, Git 브랜치와 변경 수, 남은 사용량, 활성 계정의 이메일·플랜입니다. 모델·추론 강도는 공식 Codex의 상태 줄에서 가져오므로 다음 턴을 기다리지 않고 선택한 대화와 `/model` 변경을 따라갑니다. 사용량은 계정 조회와 해당 세션의 Codex 서버가 보내는 실시간 한도 알림을 함께 반영하므로 턴 실행 중에도 갱신되며, 두 한도 표시는 같은 계정 데이터를 사용합니다. 상태 줄의 시간은 한도 초기화까지 남은 시간입니다. 계정 전환이 서버에서 승인되면 상태 줄도 새 계정으로 바뀌고 전환 알림 구간을 잠시 표시합니다. 조회되지 않은 한도는 `—`로 표시하며, 좁은 창에서는 경로·Git 표시를 줄입니다. 마우스 휠과 PageUp/PageDown으로 Codex 출력만 스크롤되고 상태 줄은 그대로 남으며, 다른 키를 누르면 현재 화면으로 돌아옵니다. codexmu는 마우스를 가로채지 않으므로 텍스트 선택·복사·Cmd+클릭은 터미널 기본 동작 그대로입니다(휠 스크롤은 Terminal.app, iTerm2, kitty, Ghostty, WezTerm이 기본으로 켜 두는 alternate scroll 동작을 이용합니다). 배경·글꼴은 사용하는 터미널 설정을 따릅니다.
 
 ```sh
 codexmu
@@ -199,7 +199,7 @@ python3 tests/check.py
 python3 tests/check.py --native "$(command -v codex)"
 
 # 실제 공식 Codex 터미널: 입력 → A 한도 → B 응답 → /quit → 터미널 복구
-python3 tests/terminal.py --codex-bin "$(command -v codex)" --resize
+python3 tests/terminal.py --codex-bin "$(command -v codex)" --model-change --usage-change --resize
 python3 tests/terminal.py --codex-bin "$(command -v codex)" --plain
 python3 tests/terminal.py --codex-bin "$(command -v codex)" --sessions 3 --resize
 ```

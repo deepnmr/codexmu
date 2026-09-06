@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    accounts::{Account, Manager},
+    accounts::{Account, Manager, Update},
     native_command,
 };
 use serde_json::{Value, json};
@@ -79,6 +79,21 @@ struct Bridge {
 }
 
 impl Bridge {
+    fn rate_limits_update(&self, value: &Value) -> Option<Update> {
+        if value["method"] != "account/rateLimits/updated" || self.login_pending {
+            return None;
+        }
+        let active = self.active.as_ref()?;
+        let limits = &value["params"]["rateLimits"];
+        if !limits["limitId"].is_null() && limits["limitId"] != "codex" {
+            return None;
+        }
+        Some(Update::RateLimits {
+            name: active.name.clone(),
+            limits: serde_json::from_value(limits.clone()).ok()?,
+        })
+    }
+
     async fn forward(
         &mut self,
         writer: &mut (impl AsyncWrite + Unpin),
@@ -360,6 +375,7 @@ pub async fn run_with_io(
                 let Some(line) = line? else { return Ok(child.wait().await?.code().unwrap_or(1) as u8); };
                 if line.len() > 16 * 1024 * 1024 { return Err("server JSON frame exceeds 16 MiB".into()); }
                 let mut value: Value = serde_json::from_str(&line).map_err(|_| "invalid Codex JSON frame")?;
+                if let Some(update) = state.rate_limits_update(&value) { manager.update(update); }
                 if value["method"] == "account/chatgptAuthTokens/refresh" {
                     let account = state.applying.as_ref().or(state.active.as_ref()).filter(|a|
                         value["params"]["previousAccountId"].as_str().is_none_or(|id| id == a.auth.account_id()));
@@ -437,6 +453,65 @@ pub async fn run_with_io(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::{Auth, Store, now};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn native_rate_limits_follow_the_acknowledged_session_account() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::new(home.path().to_owned()).unwrap();
+        for name in ["a", "b"] {
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":name})).unwrap());
+            let auth = Auth(
+                json!({"tokens":{"access_token":format!("e30.{payload}.sig"),"account_id":name}}),
+            );
+            store.add(name, auth).unwrap();
+        }
+        let accounts = store.all().unwrap();
+        store.activate(&accounts[1]).unwrap();
+        let mut state = Bridge {
+            sequence: 0,
+            requests: BTreeMap::new(),
+            busy: BTreeSet::from(["busy-thread".into()]),
+            queued: VecDeque::new(),
+            recovery: BTreeMap::new(),
+            active: Some(accounts[0].clone()),
+            applying: None,
+            initialized: true,
+            login_pending: false,
+            limited: None,
+        };
+        let mut notification = json!({"method":"account/rateLimits/updated","params":{"rateLimits":{
+            "limitId":"codex", "primary":{"usedPercent":27,"resetsAt":now()+600}
+        }}});
+        assert_eq!(store.active().unwrap().name, "b");
+        let Some(Update::RateLimits { name, limits }) = state.rate_limits_update(&notification)
+        else {
+            panic!("busy sessions must receive native quota updates");
+        };
+        assert_eq!(name, "a");
+        assert_eq!(limits.primary_window.unwrap().used_percent, 27.0);
+        assert!(limits.secondary_window.is_none());
+
+        state.applying = Some(accounts[1].clone());
+        state.login_pending = true;
+        assert!(state.rate_limits_update(&notification).is_none());
+        state.applying = None;
+        state.login_pending = false;
+        state.active = None;
+        assert!(state.rate_limits_update(&notification).is_none());
+        state.active = Some(accounts[0].clone());
+        notification["params"]["rateLimits"]["limitId"] = json!("other-model");
+        assert!(state.rate_limits_update(&notification).is_none());
+        notification["params"]["rateLimits"]["limitId"] = Value::Null;
+        assert!(state.rate_limits_update(&notification).is_some());
+        notification["method"] = json!("other/notification");
+        assert!(state.rate_limits_update(&notification).is_none());
+        notification["method"] = json!("account/rateLimits/updated");
+        notification["params"]["rateLimits"]["primary"]["usedPercent"] = json!("invalid");
+        assert!(state.rate_limits_update(&notification).is_none());
+    }
+
     #[test]
     fn only_structured_quota_errors_trigger_switching() {
         assert!(limit_error(

@@ -375,17 +375,21 @@ impl Store {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Window {
+    #[serde(alias = "usedPercent")]
     pub used_percent: f64,
+    #[serde(alias = "resetsAt")]
     pub reset_at: Option<i64>,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Limits {
     pub allowed: Option<bool>,
     pub limit_reached: Option<bool>,
+    #[serde(alias = "primary")]
     pub primary_window: Option<Window>,
+    #[serde(alias = "secondary")]
     pub secondary_window: Option<Window>,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Usage {
     pub rate_limit: Limits,
 }
@@ -401,11 +405,13 @@ pub enum Update {
         name: String,
         usage: Usage,
     },
+    RateLimits {
+        name: String,
+        limits: Limits,
+    },
     Notice(String),
     Session {
-        model: Option<String>,
-        effort: Option<String>,
-        cwd: Option<String>,
+        cwd: String,
     },
 }
 impl Usage {

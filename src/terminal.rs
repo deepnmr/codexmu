@@ -90,11 +90,8 @@ async fn transport(
 
 fn session_update(manager: &Manager, value: &serde_json::Value) {
     let string = |v: &serde_json::Value| v.as_str().map(str::to_owned);
-    let model = string(&value["model"]);
-    let effort = string(&value["reasoningEffort"]).or_else(|| string(&value["effort"]));
-    let cwd = string(&value["cwd"]).or_else(|| string(&value["thread"]["cwd"]));
-    if model.is_some() || effort.is_some() || cwd.is_some() {
-        manager.update(Update::Session { model, effort, cwd });
+    if let Some(cwd) = string(&value["cwd"]).or_else(|| string(&value["thread"]["cwd"])) {
+        manager.update(Update::Session { cwd });
     }
 }
 
@@ -198,8 +195,11 @@ async fn run_dashboard(
     manager.updates = Some(updates);
     manager.activated(&manager.credentials().await?);
     let mut command = native_command(&binary, &manager.store)?;
-    command.args(["--remote", &endpoint, "-c", "tui.status_line=[\"context-remaining\",\"fast-mode\",\"five-hour-limit\",\"weekly-limit\",\"codex-version\"]", "-c", "tui.status_line_use_colors=true"])
-        .args(args);
+    // Keep the display fields in the order the compositor reads, before any literal prompt.
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    command.args(["--remote", &endpoint]).args(&args[..end])
+        .args(["-c", "tui.status_line=[\"context-remaining\",\"model-with-reasoning\",\"fast-mode\",\"five-hour-limit\",\"weekly-limit\",\"codex-version\"]", "-c", "tui.status_line_use_colors=true"])
+        .args(&args[end..]);
     let mut view = dashboard::View::start(command.as_std(), receiver)?;
     let connection = tokio::select! {
         result = view.run() => return result,

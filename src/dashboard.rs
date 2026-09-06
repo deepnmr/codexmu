@@ -15,8 +15,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Default)]
 pub struct Status {
-    model: String,
-    effort: String,
     cwd: String,
     git: String,
     name: String,
@@ -37,22 +35,30 @@ impl Status {
             Update::Usage { name, usage } => {
                 self.usage.insert(name, usage);
             }
-            Update::Notice(message) => self.notice = Some((message, Instant::now())),
-            Update::Session { model, effort, cwd } => {
-                if let Some(model) = model {
-                    self.model = model;
-                }
-                if let Some(effort) = effort {
-                    self.effort = effort;
-                }
-                if let Some(cwd) = cwd {
-                    self.cwd = cwd;
+            Update::RateLimits { name, limits } => {
+                let usage = self.usage.entry(name).or_default();
+                for (current, update) in [
+                    (&mut usage.rate_limit.primary_window, limits.primary_window),
+                    (
+                        &mut usage.rate_limit.secondary_window,
+                        limits.secondary_window,
+                    ),
+                ] {
+                    if let Some(mut window) = update {
+                        // Native notifications are sparse; absent metadata does not clear it.
+                        window.reset_at = window
+                            .reset_at
+                            .or_else(|| current.as_ref().and_then(|w| w.reset_at));
+                        *current = Some(window);
+                    }
                 }
             }
+            Update::Notice(message) => self.notice = Some((message, Instant::now())),
+            Update::Session { cwd } => self.cwd = cwd,
         }
     }
 
-    fn header(&self, width: usize) -> String {
+    fn header(&self, model: &str, width: usize) -> String {
         let quota = self
             .usage
             .get(&self.name)
@@ -78,12 +84,6 @@ impl Status {
         } else {
             format!("{} ({})", self.email, self.plan)
         };
-        let effort = if self.effort.is_empty() && !self.model.is_empty() {
-            "default"
-        } else {
-            &self.effort
-        };
-        let model = format!("{} {effort}", self.model).trim().to_owned();
         let notice = self
             .notice
             .as_ref()
@@ -93,7 +93,7 @@ impl Status {
         let mut segments = vec![
             ("codexmu".to_owned(), 111),
             (notice, 222),
-            (clip(&model, 27), 116),
+            (clip(model, 27), 116),
             (clip_path(&self.cwd, (width / 5).clamp(10, 36)), 222),
             (clip(&self.git, 20), 111),
             (quota, 116),
@@ -129,13 +129,21 @@ impl Status {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .collect();
+        // The native status line puts model-with-reasoning immediately after context.
+        // It follows local /model changes and the selected thread before a turn starts.
+        let model = if parts.len() > 1 {
+            parts.remove(1)
+        } else {
+            String::new()
+        };
+        // Both quota displays use the current account's latest query or live update.
+        parts.retain(|s| !s.starts_with("5h") && !s.starts_with("weekly"));
         if let Some(usage) = self.usage.get(&self.name) {
             for (label, window) in [
                 ("5h", &usage.rate_limit.primary_window),
                 ("weekly", &usage.rate_limit.secondary_window),
             ] {
-                if !parts.iter().any(|s| s.starts_with(label))
-                    && let Some(window) = window
+                if let Some(window) = window
                     && window.used_percent.is_finite()
                     && (0.0..=100.0).contains(&window.used_percent)
                     && window.reset_at.is_none_or(|t| t > now())
@@ -152,7 +160,7 @@ impl Status {
             .map(|p| p.width() + 3)
             .sum::<usize>()
             .saturating_sub(3);
-        let header = self.header(width.saturating_sub(native_width + 3).max(40));
+        let header = self.header(&model, width.saturating_sub(native_width + 3).max(40));
         let mut remaining = width.saturating_sub(visible_width(&header) + 3);
         let mut result = format!("{header}   ");
         for (i, part) in parts.iter().enumerate() {
@@ -925,6 +933,62 @@ async fn git_status(cwd: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn footer_tracks_native_model_and_effort_before_the_next_turn() {
+        let state = Status::default();
+        for model in ["gpt-6-astra high", "gpt-5.1 low", "gpt-5.1 medium"] {
+            let native = format!("Context 87% left · {model} · Fast off · 0.153.4");
+            let line = state.footer(&native, 200);
+            assert!(
+                line.find(model).unwrap() < line.find("Context 87% left").unwrap(),
+                "the model and effort must appear in the codexmu header: {line}"
+            );
+            assert_eq!(line.matches(model).count(), 1);
+            assert!(visible_width(&line) <= 200);
+            assert!(state.footer(&native, 72).contains(model));
+        }
+    }
+
+    #[test]
+    fn footer_keeps_quota_bound_to_the_active_account() {
+        let mut state = Status::default();
+        state.update(Update::Active {
+            name: "b".into(),
+            email: "b@example.test".into(),
+            plan: "plus".into(),
+        });
+        state.update(Update::Usage {
+            name: "b".into(),
+            usage: serde_json::from_value(serde_json::json!({
+                "rate_limit": {"primary_window": {"used_percent": 15, "reset_at": now() + 600}}
+            }))
+            .unwrap(),
+        });
+        let line = state.footer(
+            "Context 87% left · gpt-5.1 medium · 5h 90% · weekly 90% · 0.153.4",
+            240,
+        );
+        assert!(line.contains("5h 85%"));
+        assert!(
+            !line.contains("90%"),
+            "stale native quota leaked into the footer: {line}"
+        );
+        state.update(Update::RateLimits {
+            name: "b".into(),
+            limits: serde_json::from_value(serde_json::json!({
+                "primary": {"usedPercent": 27, "resetsAt": null}
+            }))
+            .unwrap(),
+        });
+        let line = state.footer("Context 87% left · gpt-5.1 medium · 5h 85% · 0.153.4", 240);
+        assert_eq!(line.matches("5h 73%").count(), 2);
+        assert!(!line.contains("85%"));
+        assert!(
+            line.contains(" · 0h"),
+            "a sparse update must retain the known reset"
+        );
+    }
+
+    #[test]
     fn header_tracks_only_active_quota_and_clips_terminal_controls() {
         let mut state = Status::default();
         state.update(Update::Usage { name: "a".into(), usage: serde_json::from_value(serde_json::json!({"rate_limit":{"primary_window":{"used_percent":100,"reset_at":now()+600}}})).unwrap() });
@@ -933,9 +997,12 @@ mod tests {
             email: "b@example.test".into(),
             plan: "plus".into(),
         });
-        assert!(state.header(120).contains("5h —"));
-        assert!(state.header(120).contains("b@example.test"));
-        let line = state.footer("  Context 87% left · Fast off · 0.153.4", 200);
+        assert!(state.header("", 120).contains("5h —"));
+        assert!(state.header("", 120).contains("b@example.test"));
+        let line = state.footer(
+            "  Context 87% left · gpt-5.1 medium · Fast off · 0.153.4",
+            200,
+        );
         assert!(line.contains("codexmu") && line.contains("b@example.test"));
         assert!(line.contains("Context 87% left") && line.contains("0.153.4"));
         assert!(visible_width(&line) <= 200);
