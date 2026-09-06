@@ -75,20 +75,18 @@ Duplicate accounts, overwriting an existing name, and deleting the active accoun
 
 After registering accounts, **run `codexmu` to open the official Codex terminal UI.** When a usage-limit error occurs, it switches to another registered account and automatically continues work in the same conversation.
 
-A colored status header appears just above the input area, inspired by the `codext` preview:
+codexmu merges its own colored segments into the official status line below the input area and pins that line to the bottom row:
 
 ![codexmu terminal preview](docs/terminal-preview.png)
 
-The image replays actual PTY output from a local fake-account test in a terminal emulator.
+The image is a Terminal.app capture of a local fake-account run.
 
 ```text
-codexmu │ gpt-5.1 medium │ …/codexmu │ main +2 │ 5h 85% · 0h42m │ user@example.com (plus)
-
 › Explain this project
-  Context 100% left · Fast off · 5h 85% · weekly 58% · 0.153.4
+ codexmu │ gpt-5.1 medium │ …/codexmu │ main +2 │ 5h 85% · 0h42m │ user@example.com (plus)   Context 100% left · Fast off · 5h 85% · weekly 58% · 0.153.4
 ```
 
-The header shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the header updates and briefly shows a notification. Unavailable quota data appears as `—`; narrow windows shorten or hide path and Git details. Your terminal controls the background and font.
+The status line shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the status line updates and briefly shows a switch notice segment. Unavailable quota data appears as `—`; narrow windows shorten or hide path, Git, and native details. The mouse wheel scrolls the Codex output while the status line stays in place; press any key to jump back to the live view. Because codexmu captures the wheel, hold Option (macOS Terminal, iTerm2) or Shift (kitty, Ghostty, most Linux terminals) while dragging to select text. Your terminal controls the background and font.
 
 ```sh
 codexmu
@@ -96,7 +94,7 @@ codexmu "Explain this project"
 codexmu run -- --model gpt-5.1
 codexmu run -- resume --last
 
-# Use the original official Codex layout without the status header
+# Use the original official Codex layout without the status line
 codexmu --plain
 ```
 
@@ -106,7 +104,7 @@ Account-store access, usage queries, and OAuth refresh are serialized by a store
 
 A separate startup lock serializes server startup through the initialization response to avoid official Codex SQLite initialization conflicts in a fresh home. It releases immediately after initialization so sessions can work concurrently.
 
-codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and the status header is composed over the PTY display. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use official Codex's `Ctrl+T` view for long conversations, or `--plain` when you need the native terminal keyboard and scrolling behavior.
+codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and codexmu composes the PTY display on an alternate screen with its own scrollback, so the status line stays pinned while you scroll the Codex output. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use `--plain` when you need the terminal's native scrollback and mouse selection instead.
 
 Pass Codex options after `run --` to avoid confusion with management commands and options. codexmu manages the `--remote` address. Use `codexmu --no-resume` to disable automatic continuation.
 

@@ -5,7 +5,7 @@ use crate::{
 use crossterm::{cursor, execute, terminal};
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     path::PathBuf,
     time::{Duration, Instant},
@@ -84,8 +84,15 @@ impl Status {
             &self.effort
         };
         let model = format!("{} {effort}", self.model).trim().to_owned();
+        let notice = self
+            .notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(20))
+            .map(|(message, _)| clip(message, 40))
+            .unwrap_or_default();
         let mut segments = vec![
             ("codexmu".to_owned(), 111),
+            (notice, 222),
             (clip(&model, 27), 116),
             (clip_path(&self.cwd, (width / 5).clamp(10, 36)), 222),
             (clip(&self.git, 20), 111),
@@ -93,7 +100,7 @@ impl Status {
             (account, 116),
         ];
         if width < 100 {
-            segments.remove(2);
+            segments.remove(3);
         }
         if width < 75 {
             segments.retain(|(s, _)| s != &self.git);
@@ -120,6 +127,7 @@ impl Status {
             .trim()
             .split('·')
             .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
             .collect();
         if let Some(usage) = self.usage.get(&self.name) {
             for (label, window) in [
@@ -139,8 +147,14 @@ impl Status {
                 }
             }
         }
-        let mut remaining = width.saturating_sub(2);
-        let mut result = "  ".to_owned();
+        let native_width: usize = parts
+            .iter()
+            .map(|p| p.width() + 3)
+            .sum::<usize>()
+            .saturating_sub(3);
+        let header = self.header(width.saturating_sub(native_width + 3).max(40));
+        let mut remaining = width.saturating_sub(visible_width(&header) + 3);
+        let mut result = format!("{header}   ");
         for (i, part) in parts.iter().enumerate() {
             if remaining < 4 {
                 break;
@@ -165,6 +179,24 @@ impl Status {
         result.push_str("\x1b[0m");
         result
     }
+}
+
+fn visible_width(value: &str) -> usize {
+    let mut escape = false;
+    value
+        .chars()
+        .filter(|&c| {
+            if c == '\x1b' {
+                escape = true;
+            }
+            let keep = !escape;
+            if escape && c == 'm' {
+                escape = false;
+            }
+            keep
+        })
+        .collect::<String>()
+        .width()
 }
 
 fn clip(value: &str, width: usize) -> String {
@@ -248,12 +280,152 @@ impl vt100::Callbacks for Callbacks {
     }
 }
 
+// Screen mirror with its own scrollback. Codex inserts history through a scroll region pinned to
+// the top row, which vt100 discards, so rows are captured just before each scroll drops them.
+struct Mirror {
+    parser: vt100::Parser<Callbacks>,
+    region: (u16, u16),
+    pending: Vec<u8>,
+    history: VecDeque<String>,
+    offset: usize,
+}
+
+impl Mirror {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, Callbacks::default()),
+            region: (0, rows.saturating_sub(1)),
+            pending: Vec::new(),
+            history: VecDeque::new(),
+            offset: 0,
+        }
+    }
+
+    fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+        self.region = (0, rows.saturating_sub(1));
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(chunk);
+        let rows = self.screen().size().0;
+        let (mut start, mut i) = (0, 0);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\n' | 0x0b | 0x0c => {
+                    self.parser.process(&bytes[start..i]);
+                    self.line_feed();
+                    start = i;
+                    i += 1;
+                }
+                0x1b => {
+                    let Some(&next) = bytes.get(i + 1) else { break };
+                    match next {
+                        b'[' => {
+                            let Some(end) = bytes[i + 2..]
+                                .iter()
+                                .position(|b| (0x40..=0x7e).contains(b))
+                            else {
+                                break;
+                            };
+                            let end = i + 2 + end;
+                            let params = csi_params(&bytes[i + 2..end]);
+                            match bytes[end] {
+                                b'S' => {
+                                    self.parser.process(&bytes[start..i]);
+                                    self.scroll_up(params.first().copied().unwrap_or(1).max(1));
+                                    start = i;
+                                }
+                                b'r' => {
+                                    self.parser.process(&bytes[start..=end]);
+                                    start = end + 1;
+                                    let top = params.first().copied().unwrap_or(1).max(1);
+                                    let bottom = params
+                                        .get(1)
+                                        .copied()
+                                        .unwrap_or(rows as usize)
+                                        .clamp(1, rows.max(1) as usize);
+                                    self.region = ((top - 1) as u16, (bottom - 1) as u16);
+                                }
+                                _ => {}
+                            }
+                            i = end + 1;
+                        }
+                        b'D' | b'E' => {
+                            self.parser.process(&bytes[start..i]);
+                            self.line_feed();
+                            start = i;
+                            i += 2;
+                        }
+                        _ => i += 2,
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        self.parser.process(&bytes[start..i]);
+        self.pending = bytes[i..].to_vec();
+    }
+
+    fn line_feed(&mut self) {
+        if self.screen().cursor_position().0 == self.region.1 {
+            self.capture(1);
+        }
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        self.capture(count.min(self.region.1 as usize + 1));
+    }
+
+    fn capture(&mut self, count: usize) {
+        let screen = self.screen();
+        if screen.alternate_screen() || self.region.0 != 0 {
+            return;
+        }
+        let cols = screen.size().1;
+        let lines: Vec<String> = (0..count)
+            .map(|row| render_row(screen, row as u16, cols))
+            .collect();
+        for line in lines {
+            if self.history.is_empty() && visible_width(&line) == 0 {
+                continue;
+            }
+            self.history.push_back(line);
+        }
+        while self.history.len() > 10_000 {
+            self.history.pop_front();
+        }
+        if self.offset > 0 {
+            self.offset = (self.offset + count).min(self.history.len());
+        }
+    }
+
+    fn scroll(&mut self, delta: isize) {
+        self.offset = (self.offset as isize + delta).clamp(0, self.history.len() as isize) as usize;
+    }
+}
+
+fn csi_params(bytes: &[u8]) -> Vec<usize> {
+    bytes
+        .split(|b| *b == b';')
+        .map(|p| std::str::from_utf8(p).ok().and_then(|s| s.parse().ok()))
+        .map(|p| p.unwrap_or(0))
+        .collect()
+}
+
 pub struct View {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: mpsc::Receiver<Vec<u8>>,
-    parser: vt100::Parser<Callbacks>,
+    mirror: Mirror,
+    input_pending: Vec<u8>,
+    native: String,
     previous: Vec<String>,
     status: Status,
     updates: mpsc::UnboundedReceiver<Update>,
@@ -268,7 +440,7 @@ impl View {
     ) -> Result<Self> {
         let (cols, rows) = terminal::size()?;
         let size = PtySize {
-            rows: rows.saturating_sub(2).max(1),
+            rows: rows.max(1),
             cols: cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
@@ -313,12 +485,9 @@ impl View {
             child,
             writer,
             output,
-            parser: vt100::Parser::new_with_callbacks(
-                size.rows,
-                size.cols,
-                0,
-                Callbacks::default(),
-            ),
+            mirror: Mirror::new(size.rows, size.cols),
+            input_pending: Vec::new(),
+            native: String::new(),
             previous: Vec::new(),
             status: Status {
                 cwd,
@@ -334,6 +503,7 @@ impl View {
             terminal::EnterAlternateScreen,
             cursor::Hide
         )?;
+        std::io::stdout().write_all(b"\x1b[?1000h\x1b[?1006h")?;
         view.draw()?;
         Ok(view)
     }
@@ -350,14 +520,14 @@ impl View {
                 n = self.input.read(&mut bytes) => {
                     let n = n?;
                     if n == 0 { return Ok(0); }
-                    self.writer.write_all(&bytes[..n])?;
-                    self.writer.flush()?;
+                    self.handle_input(&bytes[..n])?;
+                    dirty = true;
                 }
                 output = self.output.recv() => match output {
                     Some(bytes) => {
                         dirty = true;
-                        self.parser.process(&bytes);
-                        let callback = self.parser.callbacks_mut();
+                        self.mirror.feed(&bytes);
+                        let callback = self.mirror.parser.callbacks_mut();
                         self.writer.write_all(&std::mem::take(&mut callback.replies))?;
                         self.writer.flush()?;
                     }
@@ -370,8 +540,8 @@ impl View {
                     if size != self.size {
                         self.size = size;
                         let (cols, rows) = size;
-                        self.master.resize(PtySize { rows: rows.saturating_sub(2).max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
-                        self.parser.screen_mut().set_size(rows.saturating_sub(2).max(1), cols.max(1));
+                        self.master.resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 }).map_err(|e| e.to_string())?;
+                        self.mirror.resize(rows.max(1), cols.max(1));
                         self.previous.clear();
                         dirty = true;
                     }
@@ -393,67 +563,128 @@ impl View {
         }
     }
 
-    fn draw(&mut self) -> Result<()> {
-        let screen = self.parser.screen();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let (rows, cols) = screen.size();
-        let text: Vec<String> = screen.rows(0, cols).collect();
-        // Locate the live composer's prompt in the parsed screen, not in raw output chunks.
-        let header_row = (0..=cursor_row.min(rows - 1))
-            .rev()
-            .find(|row| text[*row as usize].trim_start().starts_with('›'))
-            .unwrap_or(0) as usize;
-        let mut lines: Vec<String> = (0..rows)
-            .map(|row| {
-                let content = &text[row as usize];
-                if row as usize > header_row && content.trim_start().starts_with("Context ") {
-                    self.status.footer(content, cols as usize)
-                } else {
-                    render_row(
-                        screen,
-                        row,
-                        cols,
-                        row as usize == header_row && content.trim_start().starts_with('›'),
-                    )
+    // Wheel events scroll the mirror; every other key jumps back to the live view and reaches Codex.
+    fn handle_input(&mut self, chunk: &[u8]) -> Result<()> {
+        let mut bytes = std::mem::take(&mut self.input_pending);
+        bytes.extend_from_slice(chunk);
+        let mut forward = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1..].starts_with(b"[<") {
+                match bytes[i + 3..].iter().position(|b| matches!(b, b'M' | b'm')) {
+                    Some(p) => {
+                        let end = i + 3 + p;
+                        self.mouse(&csi_params(&bytes[i + 3..end]), &mut forward);
+                        i = end + 1;
+                        continue;
+                    }
+                    None if bytes.len() - i < 24 => {
+                        self.input_pending = bytes[i..].to_vec();
+                        break;
+                    }
+                    None => {}
                 }
+            } else if bytes[i] == 0x1b && bytes[i + 1..] == *b"[" {
+                self.input_pending = bytes[i..].to_vec();
+                break;
+            }
+            forward.push(bytes[i]);
+            i += 1;
+        }
+        if !forward.is_empty() {
+            self.mirror.offset = 0;
+            self.writer.write_all(&forward)?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn mouse(&mut self, params: &[usize], forward: &mut Vec<u8>) {
+        let button = params.first().copied().unwrap_or(0);
+        if button & 64 == 0 {
+            return;
+        }
+        let up = button & 3 == 0;
+        if self.mirror.screen().alternate_screen() {
+            forward.extend(if up {
+                b"\x1b[A\x1b[A\x1b[A"
+            } else {
+                b"\x1b[B\x1b[B\x1b[B"
+            });
+        } else {
+            self.mirror.scroll(if up { 3 } else { -3 });
+        }
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        let screen = self.mirror.screen();
+        let (rows, cols) = screen.size();
+        let (rows_u, cols_u) = (rows as usize, cols as usize);
+        let alt = screen.alternate_screen();
+        let text: Vec<String> = screen.rows(0, cols).collect();
+        let context_row = (!alt)
+            .then(|| {
+                (0..rows_u)
+                    .rev()
+                    .find(|row| text[*row].trim_start().starts_with("Context "))
             })
+            .flatten();
+        if let Some(row) = context_row {
+            self.native = text[row].clone();
+        }
+        let offset = if alt {
+            0
+        } else {
+            self.mirror.offset.min(self.mirror.history.len())
+        };
+        let mut lines: Vec<String> = self
+            .mirror
+            .history
+            .iter()
+            .skip(self.mirror.history.len() - offset)
+            .take(rows_u)
+            .cloned()
             .collect();
-        lines.insert(header_row, self.status.header(cols as usize));
-        let notice = self
-            .status
-            .notice
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(20))
-            .map(|(message, _)| {
-                format!(
-                    " \x1b[38;5;222m{}\x1b[0m",
-                    clip(message, cols.saturating_sub(2) as usize)
-                )
-            })
-            .unwrap_or_default();
-        lines.insert(header_row + 1, notice);
+        let live = rows_u - lines.len();
+        lines.extend((0..live).map(|row| render_row(screen, row as u16, cols)));
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let mut cursor_row = cursor_row as usize;
+        if !alt {
+            match context_row.filter(|_| offset == 0) {
+                Some(row) => {
+                    lines.remove(row);
+                    if cursor_row > row {
+                        cursor_row -= 1;
+                    }
+                }
+                None => {
+                    lines.pop();
+                }
+            }
+            lines.push(self.status.footer(&self.native, cols_u));
+        }
         let mut frame = Vec::new();
         frame.extend(b"\x1b[?2026h\x1b[?25l\x1b[?7l");
-        frame.extend(std::mem::take(&mut self.parser.callbacks_mut().effects));
+        frame.extend(std::mem::take(
+            &mut self.mirror.parser.callbacks_mut().effects,
+        ));
         for (row, line) in lines.iter().enumerate().take(self.size.1 as usize) {
             if self.previous.get(row) != Some(line) {
                 write!(frame, "\x1b[{};1H\x1b[0m\x1b[2K{line}", row + 1)?;
             }
         }
-        let screen = self.parser.screen();
-        let row = cursor_row as usize
-            + if cursor_row as usize >= header_row {
-                2
-            } else {
-                0
-            };
+        let screen = self.mirror.screen();
         write!(
             frame,
             "\x1b[0m\x1b[{};{}H\x1b[?7h\x1b[?2004{}\x1b[?25{}\x1b[?2026l",
-            (row + 1).min(self.size.1 as usize),
+            (cursor_row + 1).min(self.size.1 as usize),
             cursor_col + 1,
             if screen.bracketed_paste() { 'h' } else { 'l' },
-            if screen.hide_cursor() { 'l' } else { 'h' }
+            if screen.hide_cursor() || offset > 0 {
+                'l'
+            } else {
+                'h'
+            }
         )?;
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(&frame)?;
@@ -467,7 +698,8 @@ impl Drop for View {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[?2004l\x1b[?2026l\x1b[?7h");
+        let _ = std::io::stdout()
+            .write_all(b"\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?2026l\x1b[?7h");
         let _ = execute!(
             std::io::stdout(),
             cursor::Show,
@@ -477,7 +709,7 @@ impl Drop for View {
     }
 }
 
-fn render_row(screen: &vt100::Screen, row: u16, cols: u16, composer: bool) -> String {
+fn render_row(screen: &vt100::Screen, row: u16, cols: u16) -> String {
     let mut result = String::new();
     let mut previous = String::new();
     for col in 0..cols {
@@ -499,12 +731,7 @@ fn render_row(screen: &vt100::Screen, row: u16, cols: u16, composer: bool) -> St
                 style.push_str(&format!(";{code}"));
             }
         }
-        let background = if composer && cell.bgcolor() == vt100::Color::Default {
-            vt100::Color::Idx(236)
-        } else {
-            cell.bgcolor()
-        };
-        for (color, code) in [(cell.fgcolor(), 38), (background, 48)] {
+        for (color, code) in [(cell.fgcolor(), 38), (cell.bgcolor(), 48)] {
             match color {
                 vt100::Color::Default => {}
                 vt100::Color::Idx(n) => style.push_str(&format!(";{code};5;{n}")),
@@ -597,11 +824,18 @@ mod tests {
         });
         assert!(state.header(120).contains("5h —"));
         assert!(state.header(120).contains("b@example.test"));
+        let line = state.footer("  Context 87% left · Fast off · 0.153.4", 200);
+        assert!(line.contains("codexmu") && line.contains("b@example.test"));
+        assert!(line.contains("Context 87% left") && line.contains("0.153.4"));
+        assert!(visible_width(&line) <= 200);
+        assert_eq!(visible_width("\x1b[38;5;111mab\x1b[0m"), 2);
         assert_eq!(clip("ab\x1b\ncd", 3), "ab…");
         assert!(clip("한국어", 4).width() <= 4);
-        let mut parser = vt100::Parser::new_with_callbacks(20, 80, 0, Callbacks::default());
-        parser.process(b"\x1b[3;4H\x1b[");
-        parser.process(b"6n");
-        assert_eq!(parser.callbacks().replies, b"\x1b[3;4R");
+        state.update(Update::Notice("switched a -> b".into()));
+        assert!(
+            state
+                .footer("Context 50% left", 200)
+                .contains("switched a -> b")
+        );
     }
 }

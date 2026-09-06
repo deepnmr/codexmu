@@ -29,7 +29,7 @@ struct Cli {
     /// Switch accounts without automatically sending a continuation turn.
     #[arg(long, env = "CODEXMU_NO_RESUME", global = true)]
     no_resume: bool,
-    /// Use the unmodified official terminal layout without the codexmu status header.
+    /// Use the unmodified official terminal layout without the codexmu status line.
     #[arg(long, global = true)]
     plain: bool,
     #[arg(
