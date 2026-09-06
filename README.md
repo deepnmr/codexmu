@@ -28,7 +28,7 @@ You can install a locally built package immediately. Local builds include only t
 npm run build
 mkdir -p dist
 npm pack --pack-destination dist
-npm install -g ./dist/codexmu-0.2.2.tgz
+npm install -g ./dist/codexmu-0.2.3.tgz
 codexmu --version
 ```
 
