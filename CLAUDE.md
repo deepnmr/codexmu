@@ -44,7 +44,7 @@ python3 tests/check.py --native "$(command -v codex)"
 **accounts.rs** — Account and token lifecycle management
 - `Auth`: Wraps auth.json data; validates structure, decodes JWT claims (email, plan, user ID), checks expiration, refreshes OAuth tokens
 - `Store`: File-based account repository; atomic writes prevent corruption; per-account `blocked_until` tracks rate-limit backoff
-- `Manager`: High-level orchestration—refreshes tokens, queries usage API, probes current quotas, picks next account from the highest `priority` tier with headroom, lowest usage percent within it; `--switch-at` switches early between turns once the active account reaches that percent (tiers only choose the destination; no switch-back to a higher tier). A structured limit error blocks the account until its next reported reset
+- `Manager`: High-level orchestration—refreshes tokens, queries usage API, probes current quotas, picks next account from the highest `priority` tier with headroom, lowest usage percent within it; `--switch-at` switches early between turns once the active account reaches that percent (tiers only choose the destination; no switch-back to a higher tier). A structured limit error blocks the account until its next reported reset only when the usage report confirms exhaustion; otherwise just the 60s minimum cooldown, since the error may come from a Codex thread still using a previous account's credentials
 - `Usage`: Parses OpenAI's rate-limit windows (primary / secondary, both have percent-used and reset time); considers exhausted if `limit_reached=true` or either window is 100% without reset
 
 **bridge.rs** — JSON-RPC proxy for live app integration

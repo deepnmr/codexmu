@@ -267,6 +267,8 @@ def main():
         before = (root / "home/auth.json").read_bytes()
         run("watch", "--once")
         assert (root / "home/auth.json").read_bytes() == before
+        # A limit the usage report confirms excludes the account until its reported reset.
+        assert json.loads((root / "home/codexmu/accounts/b.json").read_text())["blocked_until"] > time.time() + 300
         def unblock():
             # Clear persisted cooldowns from the prior independent scenarios.
             for path in (root / "home/codexmu/accounts").glob("*.json"):
@@ -349,8 +351,10 @@ def main():
             done = peer.until(lambda v: v.get("method") == "turn/completed")
             assert done["params"]["turn"]["status"] == "completed"
             assert json.loads((root / "home/auth.json").read_text())["tokens"]["account_id"] == "b"
-            # The usage report said A was fine; the limit error still excludes A until its next reset.
-            assert json.loads((root / "home/codexmu/accounts/a.json").read_text())["blocked_until"] > time.time() + 300
+            # The usage report said A was fine, so the limit error (for example from a Codex thread that kept
+            # another seat's credentials after a switch) only excludes A for the minimum cooldown, not its whole window.
+            blocked = json.loads((root / "home/codexmu/accounts/a.json").read_text())["blocked_until"]
+            assert time.time() < blocked <= time.time() + 60, blocked
             peer.send({"id": 3, "method": "fake/refresh"})
             peer.until(lambda v: v.get("method") == "fake/refreshed")
             peer.send({"id": 4, "method": "account/read"})

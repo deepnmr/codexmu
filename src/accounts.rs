@@ -647,11 +647,13 @@ impl Manager {
         }
         self.store.activate(&account)
     }
-    /// A limit outranks the usage report: exclude the account until its next reported reset.
+    /// A limit the usage report confirms excludes the account until its next reported reset. One it
+    /// does not confirm (for example from a Codex thread that kept another seat's credentials after
+    /// a switch) is only the minimum cooldown, so a healthy account is not lost for its whole window.
     async fn limit(&self, account: &mut Account) -> Result<()> {
         let reset = match self.usage(account).await {
-            Ok(usage) => usage.reset_at(),
-            Err(_) => None,
+            Ok(usage) if usage.exhausted() => usage.reset_at(),
+            _ => None,
         };
         account.blocked_until = reset.unwrap_or(0).max(now() + 60);
         self.store.save(account)
