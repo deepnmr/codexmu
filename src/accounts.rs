@@ -276,7 +276,8 @@ impl Store {
         self.save(&pending.updated)?;
         if self
             .active_auth()?
-            .is_some_and(|auth| auth.0 == pending.before.0)
+            // Metadata rewrites do not mean another process rotated the credentials.
+            .is_some_and(|auth| auth.0["tokens"] == pending.before.0["tokens"])
         {
             atomic_json(&self.home.join("auth.json"), &pending.updated.auth.0)?;
         }
@@ -613,8 +614,8 @@ impl Manager {
                 a.name == previous.name && a.auth.identity().ok() == previous.auth.identity().ok()
             })
             .ok_or("this session's account is no longer registered; log in again")?;
-        // A different session may have already rotated this refresh token while we waited.
-        if account.auth.0 == previous.auth.0 || account.auth.expired() {
+        // Reuse actual token rotation by another session, not metadata-only changes.
+        if account.auth.0["tokens"] == previous.auth.0["tokens"] || account.auth.expired() {
             self.refresh(&mut account).await?;
         }
         Ok(account)
