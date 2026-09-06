@@ -100,7 +100,7 @@ codexmu --plain
 
 **Multiple `codexmu` windows can run simultaneously with the same `CODEX_HOME`.** Run `codexmu` in each terminal. They share the account list and default active account; each window's official Codex server manages its own conversations, approvals, and live authentication. When another window switches accounts, each window applies the new account during a usage check after its current turn finishes. A window receiving a usage-limit error attempts a switch immediately.
 
-Account-store access, usage queries, and OAuth refresh are serialized by a store lock. Concurrent refreshes reuse tokens already refreshed by another window and do not overwrite the authentication of a window working with a different account. The lock is not held for the entire session.
+Account-store access, usage queries, and OAuth refresh are serialized by a store lock. Concurrent refreshes reuse tokens already refreshed by another window and do not overwrite the authentication of a window working with a different account. Changes to auth-file metadata alone do not count as token rotation or prevent newly refreshed tokens from being saved. The lock is not held for the entire session.
 
 A separate startup lock serializes server startup through the initialization response to avoid official Codex SQLite initialization conflicts in a fresh home. It releases immediately after initialization so sessions can work concurrently.
 

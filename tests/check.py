@@ -531,6 +531,11 @@ stream_max_retries = 0
             token_gate = threading.Event()
             peer.send({"id":3, "method":"fake/refresh"})
             assert token_entered.wait(timeout=5)
+            # An external metadata rewrite must not strand the rotated token in the account copy.
+            active_path = root / "home/auth.json"
+            value = json.loads(active_path.read_text())
+            value["last_refresh"] = "2026-09-07T00:00:00Z"
+            active_path.write_text(json.dumps(value))
             started = time.monotonic()
             peer.send({"id":4, "method":"account/read"})
             assert peer.until(lambda v: v.get("id") == 4, timeout=2)["result"]["account"] == "a"
@@ -549,6 +554,7 @@ stream_max_retries = 0
             peer.close()
             token_gate = None
         assert json.loads((root / "home/auth.json").read_text())["tokens"]["refresh_token"] == "delayed-rotated-a"
+        run("list")  # Reconciliation must preserve the newly rotated token too.
         assert json.loads((root / "home/codexmu/accounts/a.json").read_text())["auth"]["tokens"]["refresh_token"] == "delayed-rotated-a"
         print("PASS: responsive approvals/RPCs during refresh, bounded reply, late token persistence on shutdown")
         # Metadata-only changes must update the cache without another external login.
@@ -572,6 +578,9 @@ stream_max_retries = 0
             peer.until(lambda v: v.get("method") == "item/commandExecution/requestApproval")
             requests = [json.loads(line) for line in (root / "log").read_text().splitlines()]
             assert sum(v.get("method") == "account/login/start" for v in requests) == 1, "metadata must not trigger a duplicate login"
+            # A metadata change while busy is not a replacement for the rejected access token.
+            value["last_refresh"] = "2026-09-07T00:00:00Z"
+            active_path.write_text(json.dumps(value))
             count = refreshes.count("a")
             peer.send({"id":3, "method":"fake/refresh"})
             peer.until(lambda v: v.get("method") == "fake/refreshed")
