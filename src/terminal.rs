@@ -148,24 +148,29 @@ pub async fn run(
     drop(listener);
     let (pipe, server_pipe) = tokio::io::duplex(64 * 1024);
     let (input, output) = tokio::io::split(server_pipe);
+    let server = bridge::run_with_io(
+        manager.clone(),
+        binary,
+        vec!["app-server".into()],
+        interval,
+        resume,
+        input,
+        output,
+    );
+    tokio::pin!(server);
+    let mut server_done = false;
     let outcome = {
         let relay = transport(connection, pipe, &manager);
-        let server = bridge::run_with_io(
-            manager.clone(),
-            binary,
-            vec!["app-server".into()],
-            interval,
-            resume,
-            input,
-            output,
-        );
-        tokio::pin!(relay, server);
+        tokio::pin!(relay);
         tokio::select! {
-            result = &mut server => result,
+            result = &mut server => { server_done = true; result },
             result = &mut relay => result.map(|()| 0),
             status = ui.wait() => status.map(|s| s.code().unwrap_or(1) as u8).map_err(Into::into),
         }
     }; // Closing the transport lets the native TUI exit and restore its own screen.
+    if !server_done {
+        let _ = server.await;
+    }
     match tokio::time::timeout(Duration::from_secs(3), ui.wait()).await {
         Ok(status) => {
             let status = status?;
@@ -203,24 +208,29 @@ async fn run_dashboard(
     drop(listener);
     let (pipe, server_pipe) = tokio::io::duplex(64 * 1024);
     let (input, output) = tokio::io::split(server_pipe);
+    let server = bridge::run_with_io(
+        manager.clone(),
+        binary,
+        vec!["app-server".into()],
+        interval,
+        resume,
+        input,
+        output,
+    );
+    tokio::pin!(server);
+    let mut server_done = false;
     let outcome = {
         let relay = transport(connection, pipe, &manager);
-        let server = bridge::run_with_io(
-            manager.clone(),
-            binary,
-            vec!["app-server".into()],
-            interval,
-            resume,
-            input,
-            output,
-        );
-        tokio::pin!(relay, server);
+        tokio::pin!(relay);
         tokio::select! {
-            result = &mut server => result,
+            result = &mut server => { server_done = true; result },
             result = &mut relay => result.map(|()| 0),
-            result = view.run() => return result,
+            result = view.run() => result,
         }
     };
+    if !server_done {
+        let _ = server.await;
+    }
     if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), view.run()).await
         && outcome.as_ref().is_ok_and(|code| *code == 0)
     {

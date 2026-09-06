@@ -40,6 +40,31 @@ struct Request {
     thread: Option<String>,
 }
 
+struct Refresh {
+    account: Account,
+    task: JoinHandle<Result<Account>>,
+    requests: Vec<Value>,
+    deadline: tokio::time::Instant,
+}
+
+impl Refresh {
+    async fn reply(
+        &mut self,
+        writer: &mut (impl AsyncWrite + Unpin),
+        response: Value,
+    ) -> Result<()> {
+        for id in self.requests.drain(..) {
+            let mut value = response.clone();
+            value["id"] = id;
+            send(writer, &value).await?;
+        }
+        Ok(())
+    }
+}
+
+// Leave time for the response to reach Codex before its 10-second deadline.
+const REFRESH_REPLY_TIMEOUT: Duration = Duration::from_secs(8);
+
 struct Bridge {
     sequence: u64,
     requests: BTreeMap<String, Request>,
@@ -202,14 +227,17 @@ pub async fn run_with_io(
         limited: None,
     };
     let mut job: Option<JoinHandle<Result<Account>>> = None;
+    let mut refresh: Option<Refresh> = None;
+    let mut stale_check = false;
     let mut tick = tokio::time::interval(Duration::from_secs(interval));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut check_due = false;
     let mut login_deadline = tokio::time::Instant::now();
-    loop {
+    let outcome = async { loop {
         if state.initialized
             && state.busy.is_empty()
             && job.is_none()
+            && refresh.is_none()
             && !state.login_pending
             && (state.active.is_none() || check_due || state.limited.is_some())
         {
@@ -225,6 +253,7 @@ pub async fn run_with_io(
             }));
             check_due = false;
         }
+        let refresh_deadline = refresh.as_ref().map_or(login_deadline, |r| r.deadline);
         tokio::select! {
             _ = tokio::signal::ctrl_c() => { child.kill().await?; let _ = child.wait().await; return Ok(130); }
             _ = tokio::time::sleep_until(startup_deadline), if startup_lock.is_some() => {
@@ -234,17 +263,51 @@ pub async fn run_with_io(
             _ = tokio::time::sleep_until(login_deadline), if state.login_pending => {
                 return Err("Codex did not acknowledge account login within 30 seconds".into());
             }
-            result = async { job.as_mut().expect("guarded job").await }, if job.is_some() => {
+            _ = tokio::time::sleep_until(refresh_deadline),
+                if refresh.as_ref().is_some_and(|r| !r.requests.is_empty()) => {
+                refresh.as_mut().expect("guarded refresh").reply(&mut to_server, json!({"error":{"code":-32000,"message":"Token refresh is still pending; retry shortly"}})).await?;
+                manager.notice("token refresh is still pending; preserving any rotated credentials before retry".to_owned());
+            }
+            result = async { (&mut refresh.as_mut().expect("guarded refresh").task).await }, if refresh.is_some() => {
+                let mut pending = refresh.take().expect("guarded refresh");
+                match result? {
+                    Ok(account) if !pending.requests.is_empty() => {
+                        pending.reply(&mut to_server, json!({"result":account.auth.refresh_result()})).await?;
+                        if state.login_pending { state.applying = Some(account); }
+                        else { state.active = Some(account); }
+                        if job.is_none() && !state.login_pending { state.release(&mut to_server, resume).await?; }
+                    }
+                    Ok(_) => {
+                        // The server already received an error. Reconcile saved tokens through login
+                        // on the next idle check; never pretend it accepted this late response.
+                        check_due = true;
+                    }
+                    Err(error) => {
+                        manager.notice(format!("token refresh failed: {error}"));
+                        pending.reply(&mut to_server, json!({"error":{"code":-32000,"message":"Unable to refresh this account; retry or use codexmu login"}})).await?;
+                        if job.is_none() && !state.login_pending { state.release(&mut to_server, false).await?; }
+                    }
+                }
+            }
+            result = async { job.as_mut().expect("guarded job").await }, if job.is_some() && refresh.is_none() => {
                 job = None;
+                if stale_check {
+                    stale_check = false;
+                    check_due = true;
+                    continue;
+                }
                 match result? {
                     Ok(account) => {
-                        let changed = state.active.as_ref().is_none_or(|a| a.auth.0 != account.auth.0);
+                        let changed = state.active.as_ref().is_none_or(|a| a.auth.login_params() != account.auth.login_params());
                         if changed {
                             send(&mut to_server, &json!({"id":"codexmu-login", "method":"account/login/start", "params":account.auth.login_params()})).await?;
                             state.applying = Some(account);
                             state.login_pending = true;
                             login_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        } else { state.release(&mut to_server, resume).await?; }
+                        } else {
+                            state.active = Some(account);
+                            state.release(&mut to_server, resume).await?;
+                        }
                     }
                     Err(error) => {
                         if state.active.is_none() { return Err(error); }
@@ -284,7 +347,7 @@ pub async fn run_with_io(
                     }
                     state.queued = keep;
                 }
-                if gated(&method) && (job.is_some() || state.login_pending || state.active.is_none() || state.limited.is_some()) {
+                if gated(&method) && (job.is_some() || refresh.is_some() || state.login_pending || state.active.is_none() || state.limited.is_some()) {
                     if state.queued.len() >= 128 {
                         send(&mut to_client, &json!({"id":value["id"],"error":{"code":-32000,"message":"Account switching queue is full; retry later"}})).await?;
                     } else { state.queued.push_back(value); }
@@ -298,17 +361,29 @@ pub async fn run_with_io(
                 if line.len() > 16 * 1024 * 1024 { return Err("server JSON frame exceeds 16 MiB".into()); }
                 let mut value: Value = serde_json::from_str(&line).map_err(|_| "invalid Codex JSON frame")?;
                 if value["method"] == "account/chatgptAuthTokens/refresh" {
-                    let refreshed = match &state.active {
-                        Some(active) if value["params"]["previousAccountId"].as_str().is_none_or(|id| id == active.auth.account_id()) => manager.refresh_session(active).await,
-                        _ => Err("no matching authenticated session".into()),
-                    };
-                    match refreshed {
-                        Ok(account) => {
-                            send(&mut to_server, &json!({"id":value["id"], "result":account.auth.refresh_result()})).await?;
-                            state.active = Some(account);
+                    let account = state.applying.as_ref().or(state.active.as_ref()).filter(|a|
+                        value["params"]["previousAccountId"].as_str().is_none_or(|id| id == a.auth.account_id()));
+                    if let Some(account) = account {
+                        if let Some(pending) = &mut refresh {
+                            if pending.account.auth.identity()? == account.auth.identity()? && pending.requests.len() < 128 {
+                                if pending.requests.is_empty() { pending.deadline = tokio::time::Instant::now() + REFRESH_REPLY_TIMEOUT; }
+                                pending.requests.push(value["id"].clone());
+                                continue;
+                            }
+                        } else {
+                            let manager = manager.clone();
+                            let previous = account.clone();
+                            refresh = Some(Refresh {
+                                account: account.clone(),
+                                task: tokio::spawn(async move { manager.refresh_session(&previous).await }),
+                                requests: vec![value["id"].clone()],
+                                deadline: tokio::time::Instant::now() + REFRESH_REPLY_TIMEOUT,
+                            });
+                            stale_check |= job.is_some();
+                            continue;
                         }
-                        _ => send(&mut to_server, &json!({"id":value["id"],"error":{"code":-32000,"message":"Unable to refresh this account; use codexmu login"}})).await?,
                     }
+                    send(&mut to_server, &json!({"id":value["id"],"error":{"code":-32000,"message":"No matching account or token refresh queue is full; retry shortly"}})).await?;
                     continue;
                 }
                 if value.get("method").is_none() {
@@ -318,7 +393,7 @@ pub async fn run_with_io(
                         state.active = state.applying.take();
                         if let Some(active) = &state.active { manager.activated(active); }
                         state.login_pending = false;
-                        state.release(&mut to_server, resume).await?;
+                        if refresh.is_none() { state.release(&mut to_server, resume).await?; }
                         continue;
                     }
                     if let Some(id) = value["id"].as_str() && let Some(request) = state.requests.remove(id) {
@@ -345,7 +420,18 @@ pub async fn run_with_io(
                 send(&mut to_client, &value).await?;
             }
         }
+    } }.await;
+    // Stop the server before draining auth work. Cancelling an OAuth request after it
+    // rotates a single-use token can lose that token, even after the RPC timed out.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    if let Some(pending) = refresh {
+        let _ = pending.task.await;
     }
+    if let Some(pending) = job {
+        let _ = pending.await;
+    }
+    outcome
 }
 
 #[cfg(test)]
