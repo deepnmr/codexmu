@@ -188,7 +188,7 @@ $CODEX_HOME/codexmu/terminal-<PID>.log        Per-session official server diagno
 | `--switch-at` | `CODEXMU_SWITCH_AT` | 100 (switch only at the limit); 1–100 |
 | `--plain` | — | false (show the codexmu status line) |
 
-Failed usage requests, responses without a valid usage window, and past reset timestamps are not treated as evidence of available quota. Accounts that reach their limits are excluded from selection for at least 60 seconds, and after a `usageLimitExceeded` error until the next reported usage reset, even if the usage report still shows headroom. `--dry-run` does not switch accounts, but may refresh OAuth tokens to keep credentials valid.
+Failed usage requests, responses without a valid usage window, and past reset timestamps are not treated as evidence of available quota. Accounts that reach their limits are excluded from selection for at least 60 seconds. After a `usageLimitExceeded` error, the exclusion lasts until the next reported usage reset when the usage report confirms the limit; if the report still shows headroom, for example because a Codex thread kept a previous account's credentials after a switch, only that minimum cooldown applies and the account is checked again afterwards. `--dry-run` does not switch accounts, but may refresh OAuth tokens to keep credentials valid.
 
 ## Validation
 
