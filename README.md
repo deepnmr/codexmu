@@ -86,7 +86,7 @@ The image is a Terminal.app capture of a local fake-account run.
  codexmu │ gpt-5.1 medium │ …/codexmu │ main +2 │ 5h 85% · 0h42m │ user@example.com (plus)   Context 100% left · Fast off · 5h 85% · weekly 58% · 0.153.4
 ```
 
-The status line shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the status line updates and briefly shows a switch notice segment. Unavailable quota data appears as `—`; narrow windows shorten or hide path, Git, and native details. The mouse wheel scrolls the Codex output while the status line stays in place; press any key to jump back to the live view. Because codexmu captures the wheel, hold Option (macOS Terminal, iTerm2) or Shift (kitty, Ghostty, most Linux terminals) while dragging to select text. Your terminal controls the background and font.
+The status line shows the session model, reasoning effort, working directory, Git branch and change count, queried remaining usage, and active account email and plan. The time is the countdown to the usage reset. Once the server acknowledges an account switch, the status line updates and briefly shows a switch notice segment. Unavailable quota data appears as `—`; narrow windows shorten or hide path, Git, and native details. The mouse wheel and PageUp/PageDown scroll the Codex output while the status line stays in place; any other key jumps back to the live view. codexmu never captures the mouse, so selecting text, copying, and Cmd+click keep working exactly as in your terminal (wheel scrolling relies on the alternate-scroll behavior that Terminal.app, iTerm2, kitty, Ghostty, and WezTerm enable by default). Your terminal controls the background and font.
 
 ```sh
 codexmu
@@ -104,7 +104,7 @@ Account-store access, usage queries, and OAuth refresh are serialized by a store
 
 A separate startup lock serializes server startup through the initialization response to avoid official Codex SQLite initialization conflicts in a fresh home. It releases immediately after initialization so sessions can work concurrently.
 
-codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and codexmu composes the PTY display on an alternate screen with its own scrollback, so the status line stays pinned while you scroll the Codex output. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use `--plain` when you need the terminal's native scrollback and mouse selection instead.
+codexmu uses official Codex's `--remote unix://...` feature, verified with CLI 0.153.4. A private temporary Unix socket connects the native terminal UI to the authentication bridge, and codexmu composes the PTY display on an alternate screen with its own scrollback, so the status line stays pinned while you scroll the Codex output. On exit, codexmu removes the socket and restores terminal settings. It opens no TCP port. Use `--plain` when you need the terminal's native scrollback instead.
 
 Pass Codex options after `run --` to avoid confusion with management commands and options. codexmu manages the `--remote` address. Use `codexmu --no-resume` to disable automatic continuation.
 

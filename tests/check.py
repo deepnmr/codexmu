@@ -57,6 +57,8 @@ def fake_codex():
             emit({"id": 72, "method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized", "previousAccountId": active}})
         elif key == 72 and "result" in value:
             emit({"method": "fake/refreshed", "params": {"account": value["result"]["chatgptAccountId"]}})
+        elif key == 72 and "error" in value:
+            emit({"method": "fake/refreshFailed", "params": value["error"]})
         elif method:
             if key is not None:
                 emit({"id": key, "result": {"echo": method}})
@@ -82,6 +84,8 @@ model_requests = []
 model_payloads = []
 probe_gate = None
 probe_entered = threading.Event()
+token_gate = None
+token_entered = threading.Event()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -160,9 +164,12 @@ class Handler(BaseHTTPRequestHandler):
         assert value["grant_type"] == "refresh_token"
         name = value["refresh_token"].split("-")[-1]
         refreshes.append(name)
+        if token_gate is not None:
+            token_entered.set()
+            assert token_gate.wait(timeout=14)
         http_errors.pop(name, None)
         tokens = auth(name)["tokens"]
-        tokens["refresh_token"] = "rotated-" + name
+        tokens["refresh_token"] = ("delayed-rotated-" if token_gate is not None else "rotated-") + name
         self.reply(200, tokens)
 
 
@@ -202,7 +209,7 @@ class Peer:
 
 
 def main():
-    global probe_gate
+    global probe_gate, token_gate
     binary = Path(os.environ.get("CODEXMU_TEST_BIN", "target/debug/codexmu")).resolve()
     fixture = Path(__file__).resolve()
     fixture.chmod(0o755)
@@ -510,6 +517,70 @@ stream_max_retries = 0
             for peer in peers:
                 peer.close()
         print("PASS: concurrent servers, independent busy turns, shared OAuth rotation, preserved default account")
+        # Slow token rotation must not block approvals/RPCs or miss the native 10s reply deadline.
+        run("switch", "a")
+        peer = Peer([str(binary), "app-server"], dict(env, FAKE_LIMITED_ACCOUNTS=""))
+        try:
+            peer.send({"id":1, "method":"initialize", "params":{"clientInfo":{"name":"slow-refresh", "version":"1"}}})
+            peer.until(lambda v: v.get("id") == 1)
+            peer.send({"method":"initialized"})
+            peer.until(lambda v: v.get("method") == "account/updated")
+            peer.send({"id":2, "method":"turn/start", "params":{"threadId":"slow-refresh", "input":[{"type":"text", "text":"wait for approval"}]}})
+            peer.until(lambda v: v.get("method") == "item/commandExecution/requestApproval")
+            token_entered.clear()
+            token_gate = threading.Event()
+            peer.send({"id":3, "method":"fake/refresh"})
+            assert token_entered.wait(timeout=5)
+            started = time.monotonic()
+            peer.send({"id":4, "method":"account/read"})
+            assert peer.until(lambda v: v.get("id") == 4, timeout=2)["result"]["account"] == "a"
+            peer.send({"id":71, "result":{"decision":"accept"}})
+            assert peer.until(lambda v: v.get("method") == "turn/completed", timeout=2)["params"]["turn"]["status"] == "completed"
+            peer.until(lambda v: v.get("method") == "fake/refreshFailed", timeout=9)
+            assert time.monotonic() - started < 10, "refresh must reply before native Codex times out"
+            # Even after that reply, the in-flight rotated token must be saved before shutdown.
+            peer.process.stdin.close()
+            time.sleep(0.2)
+            assert peer.process.poll() is None, "shutdown must drain the in-flight token rotation"
+            token_gate.set()
+        finally:
+            if token_gate is not None:
+                token_gate.set()
+            peer.close()
+            token_gate = None
+        assert json.loads((root / "home/auth.json").read_text())["tokens"]["refresh_token"] == "delayed-rotated-a"
+        assert json.loads((root / "home/codexmu/accounts/a.json").read_text())["auth"]["tokens"]["refresh_token"] == "delayed-rotated-a"
+        print("PASS: responsive approvals/RPCs during refresh, bounded reply, late token persistence on shutdown")
+        # Metadata-only changes must update the cache without another external login.
+        (root / "log").write_text("")
+        peer = Peer([str(binary), "--interval", "5", "app-server"], dict(env, FAKE_LIMITED_ACCOUNTS=""))
+        try:
+            peer.send({"id":1, "method":"initialize", "params":{"clientInfo":{"name":"metadata", "version":"1"}}})
+            peer.until(lambda v: v.get("id") == 1)
+            peer.send({"method":"initialized"})
+            peer.until(lambda v: v.get("method") == "account/updated")
+            active_path = root / "home/auth.json"
+            value = json.loads(active_path.read_text())
+            value["last_refresh"] = "2026-09-06T00:00:00Z"
+            active_path.write_text(json.dumps(value))
+            saved = root / "home/codexmu/accounts/a.json"
+            deadline = time.monotonic() + 8
+            while json.loads(saved.read_text())["auth"].get("last_refresh") != value["last_refresh"]:
+                assert time.monotonic() < deadline, "periodic account check did not reconcile metadata"
+                time.sleep(0.05)
+            peer.send({"id":2, "method":"turn/start", "params":{"threadId":"metadata", "input":[{"type":"text", "text":"wait for approval"}]}})
+            peer.until(lambda v: v.get("method") == "item/commandExecution/requestApproval")
+            requests = [json.loads(line) for line in (root / "log").read_text().splitlines()]
+            assert sum(v.get("method") == "account/login/start" for v in requests) == 1, "metadata must not trigger a duplicate login"
+            count = refreshes.count("a")
+            peer.send({"id":3, "method":"fake/refresh"})
+            peer.until(lambda v: v.get("method") == "fake/refreshed")
+            assert refreshes.count("a") == count + 1, "cached metadata must not masquerade as a new access token"
+            peer.send({"id":71, "result":{"decision":"accept"}})
+            peer.until(lambda v: v.get("method") == "turn/completed")
+        finally:
+            peer.close()
+        print("PASS: metadata-only change skips login and retains current refresh state")
     server.shutdown()
 
 

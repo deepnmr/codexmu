@@ -627,6 +627,14 @@ impl Manager {
             .into_iter()
             .find(|a| a.name == name)
             .ok_or("unknown account")?;
+        if self
+            .store
+            .active_auth()?
+            .is_some_and(|auth| auth.identity().ok() == account.auth.identity().ok())
+        {
+            // Read the live copy before refreshing or reactivating this account.
+            account = self.store.active()?;
+        }
         if account.auth.expired() {
             self.refresh(&mut account).await?;
         }
@@ -810,6 +818,29 @@ mod tests {
                 0o600
             );
         }
+    }
+    #[tokio::test]
+    async fn same_account_switch_preserves_external_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned()).unwrap();
+        let manager = Manager::new(
+            store.clone(),
+            "http://127.0.0.1/usage",
+            "http://127.0.0.1/token",
+            100,
+        )
+        .unwrap();
+        store.add("a", auth("a")).unwrap();
+        manager.switch("a").await.unwrap();
+        let mut rotated = auth("a");
+        rotated.0["tokens"]["refresh_token"] = json!("externally-rotated");
+        rotated.0["tokens"]["access_token"] = json!(format!("{}.rotated", rotated.access()));
+        atomic_json(&dir.path().join("auth.json"), &rotated.0).unwrap();
+
+        manager.switch("a").await.unwrap();
+        assert_eq!(store.active_auth().unwrap().unwrap().0, rotated.0);
+        manager.list(false).await.unwrap();
+        assert_eq!(store.all().unwrap()[0].auth.0, rotated.0);
     }
     #[tokio::test]
     async fn interrupted_refresh_is_recovered_before_reading_active_auth() {
