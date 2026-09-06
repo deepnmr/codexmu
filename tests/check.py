@@ -82,6 +82,7 @@ http_errors = {}
 refreshes = []
 model_requests = []
 model_payloads = []
+response_usage = {}
 probe_gate = None
 probe_entered = threading.Event()
 token_gate = None
@@ -108,8 +109,8 @@ class Handler(BaseHTTPRequestHandler):
             name = self.headers["ChatGPT-Account-Id"]
             self.reply(200, {"plan_type":"plus", "rate_limit": {
                 "allowed":True, "limit_reached":False,
-                "primary_window":{"used_percent":usage[name], "limit_window_seconds":18000, "reset_at":int(time.time())+600},
-                "secondary_window":{"used_percent":usage[name], "limit_window_seconds":604800, "reset_at":int(time.time())+86400}}})
+                "primary_window":{"used_percent":usage[name], "limit_window_seconds":18000, "reset_at":int(time.time())+600, "reset_after_seconds":600},
+                "secondary_window":{"used_percent":usage[name], "limit_window_seconds":604800, "reset_at":int(time.time())+86400, "reset_after_seconds":86400}}})
             return
         if self.path != "/usage":
             self.reply(200, {"models": []} if "/models" in self.path else {})
@@ -154,6 +155,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(body)))
+            if name in response_usage:
+                for window, minutes, delay in [("primary", 300, 600), ("secondary", 10080, 86400)]:
+                    self.send_header(f"x-codex-{window}-used-percent", str(response_usage[name]))
+                    self.send_header(f"x-codex-{window}-window-minutes", str(minutes))
+                    self.send_header(f"x-codex-{window}-reset-at", str(int(time.time()) + delay))
             self.end_headers()
             self.wfile.write(body)
             return
