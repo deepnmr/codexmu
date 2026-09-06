@@ -8,6 +8,8 @@ A Rust program that stores multiple ChatGPT accounts for Codex and automatically
 
 ## Installation
 
+Terminal mode supports macOS / Linux; desktop app launching supports macOS. Official Codex must support `--remote unix://...`; the previously tested CLI version is 0.153.4.
+
 ### npm
 
 Requires **Node.js 24 or later** and official Codex. The release package bundles macOS / Linux binaries for ARM64 and x64, without a Rust build or separate binary download during installation.
@@ -26,7 +28,7 @@ You can install a locally built package immediately. Local builds include only t
 npm run build
 mkdir -p dist
 npm pack --pack-destination dist
-npm install -g ./dist/codexmu-0.1.0.tgz
+npm install -g ./dist/codexmu-0.2.2.tgz
 codexmu --version
 ```
 
@@ -34,7 +36,7 @@ If you already installed through Cargo, use `command -v codexmu` to check which 
 
 ### Cargo
 
-Requires Rust 1.89 or later and official Codex. Terminal mode supports macOS / Linux; desktop app launching supports macOS. Codex must support `--remote unix://...`; the previously tested CLI version is 0.153.4.
+Requires Rust 1.89 or later and official Codex.
 
 Run from the project directory after downloading the source:
 
@@ -58,7 +60,9 @@ codexmu list --live
 codexmu
 ```
 
-All registered accounts are candidates for automatic switching. For example, if `personal` and then `work` reach their limits, codexmu can switch to an available `extra` account and continue the same conversation. Selection depends on remaining usage, not registration order. To prefer some accounts, give them a higher tier with `codexmu priority NAME 1`; usage decides only within a tier, and lower tiers are used once every account above them is unavailable. `codexmu priority personal -1` keeps `personal` as the reserve. Tiers decide where a switch goes; codexmu does not move back to a higher tier while the active account still has headroom.
+All registered accounts are candidates for automatic switching. For example, if `personal` and then `work` reach their limits, codexmu can switch to an available `extra` account and continue the same conversation. Selection depends on priority and remaining usage, not registration order.
+
+Accounts start at priority `0`. Give a preferred account a higher tier with `codexmu priority work 1`, or keep `personal` as a reserve with `codexmu priority personal -1`. codexmu first considers accounts below `--switch-at`, choosing the highest tier and then the lowest usage within that tier. At a usage limit, if none are below the threshold, it applies the same ranking to the remaining accounts with available quota. Changing priority alone does not trigger a switch.
 
 `login` runs official `codex login` in a temporary `CODEX_HOME`. Cancelling or failing login preserves the existing active account. Omit `--device-auth` for browser login. If your credentials exist only in the keychain and there is no `auth.json`, use `login` instead of `add`.
 
@@ -128,10 +132,10 @@ Terminal and desktop modes share the same switching behavior:
 
 - Query usage every 60 seconds by default, **only when no turn is running**.
 - Look for another account immediately when a turn ends with `usageLimitExceeded`.
-- Among available accounts in the highest priority tier, select the one with the lowest maximum usage across the usage windows present in the response.
+- Prefer accounts below `--switch-at`, then rank by priority tier and the lowest maximum usage across the usage windows present in the response. At a usage limit, fall back to other accounts with available quota if none are below the threshold.
 - With `--switch-at 80`, also switch between turns once the active account reaches 80% and an account below 80% exists. An early switch is not a cooldown and sends no continuation turn.
 - Send new credentials to the running official app-server through `account/login/start`, rather than only replacing a file.
-- By default, send a new continuation turn in the same thread. Do not replay the original prompt or executed tool calls.
+- After switching in response to `usageLimitExceeded`, send a new continuation turn in the same thread by default. Do not replay the original prompt or executed tool calls.
 - Defer switching while another turn is running. Queue new turns during a switch while continuing to forward approval responses. Do not execute cancelled queued turns.
 
 To switch accounts without automatic continuation:
@@ -182,12 +186,16 @@ $CODEX_HOME/codexmu/terminal-<PID>.log        Per-session official server diagno
 | `--interval` | `CODEXMU_INTERVAL` | 60 seconds; minimum 5 |
 | `--no-resume` | `CODEXMU_NO_RESUME` | false |
 | `--switch-at` | `CODEXMU_SWITCH_AT` | 100 (switch only at the limit); 1–100 |
+| `--plain` | — | false (show the codexmu status line) |
 
 Failed usage requests, responses without a valid usage window, and past reset timestamps are not treated as evidence of available quota. Accounts that reach their limits are excluded from selection for at least 60 seconds, and after a `usageLimitExceeded` error until the next reported usage reset, even if the usage report still shows headroom. `--dry-run` does not switch accounts, but may refresh OAuth tokens to keep credentials valid.
 
 ## Validation
 
+Use Node.js 24+ for npm checks; `npm run build` builds and stages the native binary before testing the package.
+
 ```sh
+npm run build
 npm test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
