@@ -996,4 +996,56 @@ mod tests {
         assert_eq!(keys.feed(b"\x1b", t0, false, false, 10), (vec![], 0));
         assert_eq!(keys.expire(t0 + HOLD), b"\x1b");
     }
+
+    #[test]
+    fn mirror_keeps_rows_dropped_by_top_pinned_scroll_regions() {
+        fn plain(line: &str) -> String {
+            let mut out = String::new();
+            let mut escape = false;
+            for c in line.chars() {
+                if c == '\x1b' {
+                    escape = true;
+                }
+                if !escape {
+                    out.push(c);
+                }
+                if escape && c == 'm' {
+                    escape = false;
+                }
+            }
+            out.trim_end().to_owned()
+        }
+        let mut mirror = Mirror::new(6, 20);
+        mirror.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        // Codex inserts history: pin rows 1-4, newline at the region bottom, then scroll up twice.
+        mirror.feed(b"\x1b[1;4r\x1b[4;1H\r\nseven\x1b[2S\x1b[r");
+        let history: Vec<String> = mirror.history.iter().map(|l| plain(l)).collect();
+        assert_eq!(history, ["one", "two", "three"]);
+        assert_eq!(
+            mirror.screen().rows(0, 20).nth(5).unwrap().trim_end(),
+            "six"
+        );
+        // A split escape sequence and a scroll inside a region that is not pinned to the top are ignored.
+        mirror.feed(b"\x1b[3;6r\x1b[6;1H\x1b");
+        mirror.feed(b"D");
+        assert_eq!(mirror.history.len(), 3);
+        // The scrolled view stays anchored while new rows keep arriving.
+        mirror.scroll(3);
+        assert_eq!(mirror.offset, 3);
+        mirror.feed(b"\x1b[r\x1b[6;1H\n");
+        assert_eq!((mirror.history.len(), mirror.offset), (4, 4));
+        // Terminal probes are answered in the mirror's coordinates, even when split across chunks.
+        let mut parser = vt100::Parser::new_with_callbacks(20, 80, 0, Callbacks::default());
+        parser.process(b"\x1b[3;4H\x1b[");
+        parser.process(b"6n");
+        assert_eq!(parser.callbacks().replies, b"\x1b[3;4R");
+        // A switch notice becomes a status line segment.
+        let mut state = Status::default();
+        state.update(Update::Notice("switched a -> b".into()));
+        assert!(
+            state
+                .footer("Context 50% left", 200)
+                .contains("switched a -> b")
+        );
+    }
 }
